@@ -4,8 +4,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createApp } from '../server/index.js';
+import { openStore, ownerDoc } from '../server/store.js';
 import { hashPassword } from '../server/auth.js';
 import { seal, open } from '../server/secretbox.js';
+import { TEST_URI, dbOpts, storeOpts, cleanup } from './testdb.js';
 
 const DAY = 86_400_000;
 const say = (text) => ({ parts: [{ text }], functionCalls: [], text });
@@ -31,16 +33,16 @@ async function makeCustomer(over = {}) {
 }
 
 before(async () => {
-  app = createApp({ chatPerMinute: 100000, loginsPerWindow: 100000, dbFile: ':memory:', secret: 'test-secret', provider: sharedAi, providerFactory: keyed, now: () => clock });
+  app = await createApp({ chatPerMinute: 100000, loginsPerWindow: 100000, ...dbOpts(), secret: 'test-secret', provider: sharedAi, providerFactory: keyed, now: () => clock });
   await new Promise((r) => app.server.listen(0, r));
   base = `http://localhost:${app.server.address().port}`;
-  app.db.prepare("INSERT INTO owners(name, email, password_hash, role, plan) VALUES('Admin','admin@x.com',?,'admin','full')").run(await hashPassword('AdminPass#123'));
+  await app.store.c('owners').insert(ownerDoc({ name: 'Admin', email: 'admin@x.com', password_hash: await hashPassword('AdminPass#123'), role: 'admin' }));
   const r = await login('admin@x.com', 'AdminPass#123');
   assert.equal(r.status, 200);
   assert.equal(r.data.owner.role, 'admin');
   ADMIN = r.data.token;
 });
-after(() => app.server.close());
+after(async () => { app.server.close(); await cleanup(app.store); });
 
 test('admin and owners are kept apart: owners cannot open admin pages, admin has no houseboat data', async () => {
   const c = await makeCustomer({ password: 'owner-pass-1' });
@@ -168,7 +170,7 @@ test('each customer uses their OWN Gemini key; the key is stored encrypted and n
   assert.equal(list.find((x) => x.id === a.owner.id).ai_calls, 1);
   assert.equal(list.find((x) => x.id === b.owner.id).ai_calls, 2);
   // the plain key is nowhere: not in the database row, not in any admin answer
-  const row = app.db.prepare('SELECT gemini_key_enc FROM owners WHERE id = ?').get(a.owner.id);
+  const row = await app.store.c('owners').one({ id: a.owner.id });
   assert.ok(row.gemini_key_enc.startsWith('v1.'));
   assert.ok(!row.gemini_key_enc.includes(KEY_A));
   assert.equal(open(row.gemini_key_enc, 'test-secret'), KEY_A);
@@ -240,14 +242,14 @@ test('creating a customer is checked: email, duplicates, days, key shape; paid c
 });
 
 test('an unreadable key (server secret changed) never falls back to the shared key', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bh6-'));
-  const file = path.join(dir, 't.db');
-  const a1 = createApp({ dbFile: file, secret: 'secret-one', provider: sharedAi, providerFactory: keyed, now: () => clock });
+  // the same database, opened by a server with a different secret
+  const shared = await openStore(TEST_URI, storeOpts());
+  const a1 = await createApp({ store: shared, secret: 'secret-one', provider: sharedAi, providerFactory: keyed, now: () => clock });
   await new Promise((r) => a1.server.listen(0, r));
   const b1 = `http://localhost:${a1.server.address().port}`;
-  a1.db.prepare("INSERT INTO owners(name, email, password_hash, role, plan, gemini_key_enc) VALUES('Boat','boat@x.com',?,'owner','full',?)").run(await hashPassword('boat-pass-12'), seal(KEY_A, 'secret-one'));
-  a1.server.close(); a1.db.close();
-  const a2 = createApp({ dbFile: file, secret: 'secret-two', provider: sharedAi, providerFactory: keyed, now: () => clock });
+  await shared.c('owners').insert(ownerDoc({ name: 'Boat', email: 'boat@x.com', password_hash: await hashPassword('boat-pass-12'), gemini_key_enc: seal(KEY_A, 'secret-one') }));
+  a1.server.close();
+  const a2 = await createApp({ store: shared, secret: 'secret-two', provider: sharedAi, providerFactory: keyed, now: () => clock });
   await new Promise((r) => a2.server.listen(0, r));
   const b2 = `http://localhost:${a2.server.address().port}`;
   const l = await (await fetch(b2 + '/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: 'boat@x.com', password: 'boat-pass-12' }) })).json();
@@ -255,7 +257,7 @@ test('an unreadable key (server secret changed) never falls back to the shared k
   const r = await (await fetch(b2 + '/api/chat', { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${l.token}` }, body: JSON.stringify({ message: 'summary' }) })).json();
   assert.equal(r.simple, true, 'simple mode instead of silently spending the shared key');
   assert.deepEqual(used, []);
-  a2.server.close(); a2.db.close();
+  a2.server.close(); await cleanup(shared);
   void b1;
 });
 
@@ -283,4 +285,55 @@ test('an owner can update their own API key: it is checked with Google first, a 
   assert.equal((await api('POST', '/api/my-ai-key', { token: t, body: { key: 'two words' } })).status, 400);
   assert.equal((await api('POST', '/api/my-ai-key', { token: ADMIN, body: { key: good } })).status, 403);
   assert.equal((await api('POST', '/api/my-ai-key', { body: { key: good } })).status, 401);
+});
+
+test('ADMIN_EMAIL + ADMIN_PASSWORD in .env create the admin on start, once, and never overwrite it', async () => {
+  const st = await openStore(TEST_URI, storeOpts());
+  const make = () => createApp({ store: st, secret: 's', provider: null, adminEmail: 'Boss@Mail.com'.toLowerCase(), adminPassword: 'Start-pass-123', adminName: 'Rohit' });
+  const a1 = await make();
+  const admin = await st.c('owners').one({ email: 'boss@mail.com' });
+  assert.equal(admin.role, 'admin'); assert.equal(admin.name, 'Rohit');
+  await new Promise((r) => a1.server.listen(0, r));
+  const base1 = `http://localhost:${a1.server.address().port}`;
+  const login = await (await fetch(base1 + '/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: 'boss@mail.com', password: 'Start-pass-123' }) })).json();
+  assert.equal(login.owner.role, 'admin');
+  a1.server.close();
+  const hash = admin.password_hash;
+  await make(); // a restart does not create a second admin or change the password
+  assert.equal(await st.c('owners').count({ email: 'boss@mail.com' }), 1);
+  assert.equal((await st.c('owners').one({ email: 'boss@mail.com' })).password_hash, hash);
+  await cleanup(st);
+});
+
+test('the chat clears itself 1 minute after the last message, never while a confirm card waits; bookings stay', async () => {
+  let now = Date.now();
+  const st = await openStore(TEST_URI, storeOpts());
+  await st.c('owners').insert(ownerDoc({ name: 'Chatty', email: 'chat@x.com', password_hash: await hashPassword('password123') }));
+  const call = (name, args) => ({ parts: [{ functionCall: { name, args } }], functionCalls: [{ name, args }], text: '' });
+  const q = []; const ai = { name: 'q', async generate() { return q.shift() || say('ok'); } };
+  const a = await createApp({ store: st, secret: 's', provider: ai, now: () => now });
+  await new Promise((r) => a.server.listen(0, r));
+  const base2 = `http://localhost:${a.server.address().port}`;
+  const call2 = async (m, p, body, t) => (await fetch(base2 + p, { method: m, headers: { 'content-type': 'application/json', ...(t ? { authorization: `Bearer ${t}` } : {}) }, body: body ? JSON.stringify(body) : undefined })).json();
+  const t = (await call2('POST', '/api/auth/login', { email: 'chat@x.com', password: 'password123' })).token;
+  assert.equal((await call2('GET', '/api/me', null, t)).chat_clean_seconds, 60);
+  const age = async (secs) => { const old = new Date(now - secs * 1000).toISOString(); await st.c('messages').updateMany({ owner_id: { $gt: 0 } }, { $set: { created_at: old } }); };
+  await call2('POST', '/api/chat', { message: 'hello' }, t);
+  assert.equal((await call2('GET', '/api/history', null, t)).messages.length, 2);
+  await age(30); // half a minute old: still there
+  assert.equal((await call2('GET', '/api/history', null, t)).messages.length, 2);
+  await age(61); // over a minute old: cleared
+  assert.equal((await call2('GET', '/api/history', null, t)).messages.length, 0);
+  // a booking card is waiting: the chat is NOT cleared even when old
+  q.push(call('create_booking', { client_name: 'Wait Me', sender: 'Direct', check_in: '2030-01-01', check_out: '2030-01-02', rooms: [{ houseboat: 'Lake', price: 1000, shikara: false }] }));
+  const card = (await call2('POST', '/api/chat', { message: 'book' }, t)).pending;
+  await age(300);
+  assert.equal((await call2('GET', '/api/history', null, t)).messages.length, 2, 'kept while the card waits');
+  // confirm it, then a minute later the chat clears but the booking stays
+  await call2('POST', '/api/confirm', { token: card.token }, t);
+  await age(61);
+  assert.equal((await call2('GET', '/api/history', null, t)).messages.length, 0);
+  assert.equal((await call2('GET', '/api/bookings', null, t)).length, 1, 'bookings are never touched');
+  a.server.close();
+  await cleanup(st);
 });

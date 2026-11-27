@@ -1,0 +1,33 @@
+# Render blueprint: Render > New > Blueprint > pick this repo. Data lives in MongoDB Atlas, so no disk is needed.
+# The values marked "sync: false" are asked for when you create it (they are secrets, never put them here).
+services:
+  - type: web
+    name: boathouse-ai
+    runtime: node
+    region: singapore     # close to MongoDB Atlas in Mumbai; cannot be changed after the service is created
+    plan: free            # free sleeps after 15 minutes without visitors; choose "starter" to keep it always on
+    buildCommand: npm install --omit=dev
+    startCommand: npm start
+    healthCheckPath: /api/config
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: NODE_ENV
+        value: production
+      - key: TRUST_PROXY
+        value: "true"
+      - key: APP_TZ
+        value: Asia/Kolkata
+      - key: GEMINI_MODEL
+        value: gemini-flash-lite-latest
+      - key: ALLOW_SIGNUP
+        value: "false"
+      - key: MONGODB_URI
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: CONTACT_INFO
+        sync: false

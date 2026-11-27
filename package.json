@@ -1,8 +1,8 @@
 {
   "name": "boathouse-ai",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "private": true,
-  "description": "Chat-first BoatHouse management dashboard. Owners talk (English / Hindi / Hinglish) and the bot edits and reads their own dashboard.",
+  "description": "Chat-first BoatHouse management dashboard. Owners talk (English / Hindi / Hinglish) and the bot edits and reads their own dashboard. Data in MongoDB.",
   "type": "module",
   "engines": {
     "node": ">=22.13"
@@ -14,7 +14,12 @@
     "add-owner": "node --no-warnings server/add-owner.js",
     "reset-password": "node --no-warnings server/reset-password.js",
     "check-ai": "node --no-warnings server/check-ai.js",
-    "test": "node --no-warnings --test test/api.test.js test/v4.test.js test/v6.test.js test/translit.test.js test/security.test.js",
-    "add-admin": "node --no-warnings server/add-admin.js"
+    "test": "node --no-warnings --test test/api.test.js test/v4.test.js test/v6.test.js test/translit.test.js test/security.test.js test/migrate.test.js",
+    "add-admin": "node --no-warnings server/add-admin.js",
+    "migrate-to-mongo": "node --no-warnings server/migrate-to-mongo.js",
+    "test:atlas": "node --no-warnings --test --test-concurrency=1 test/api.test.js test/v4.test.js test/v6.test.js test/translit.test.js test/security.test.js test/migrate.test.js"
+  },
+  "dependencies": {
+    "mongodb": "^6.17.0"
   }
 }

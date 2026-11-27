@@ -2,6 +2,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createApp } from '../server/index.js';
 import { addDays, todayStr } from '../server/util.js';
+import { TEST_URI, dbOpts, storeOpts, cleanup } from './testdb.js';
 
 // A scripted stand-in for Gemini: each generate() call returns the next prepared answer.
 function scripted() {
@@ -27,11 +28,11 @@ const D = (n) => addDays(todayStr('Asia/Kolkata'), n);
 
 before(async () => {
   ai = scripted();
-  app = createApp({ chatPerMinute: 100000, dbFile: ':memory:', secret: 'test-secret', provider: ai, allowSignup: true });
+  app = await createApp({ chatPerMinute: 100000, ...dbOpts(), secret: 'test-secret', provider: ai, allowSignup: true });
   await new Promise((r) => app.server.listen(0, r));
   base = `http://localhost:${app.server.address().port}`;
 });
-after(() => app.server.close());
+after(async () => { app.server.close(); await cleanup(app.store); });
 
 async function api(method, path, { token, body } = {}) {
   const res = await fetch(base + path, { method, headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: body ? JSON.stringify(body) : undefined });
@@ -51,7 +52,8 @@ async function propose(token, toolName, args, message = 'do it') {
 }
 const confirm = (token, t, approve = true) => api('POST', '/api/confirm', { token, body: { token: t, approve } });
 
-const room = (houseboat, guests, price, meal_plan, extra = {}) => ({ houseboat, guests, price, meal_plan, ...extra });
+// shikara: false = "no shikara ride" (so only the details a test skips on purpose show as pending)
+const room = (houseboat, guests, price, meal_plan, extra = {}) => ({ houseboat, guests, price, meal_plan, shikara: false, ...extra });
 // The 8-room example from the owner: 4 own, 2 Chinar, 2 Cultural Palace.
 const eightRooms = (extra = {}) => ({
   sender: 'Direct', client_name: 'Sharma Family', phone: '9876500001', check_in: D(10), check_out: D(12), ...extra,
@@ -84,17 +86,18 @@ test('auth: signup, login, wrong password, protected routes', async () => {
 });
 
 test('change password: needs the current one, updates the database hash, signs other devices out', async () => {
-  const hash0 = app.db.prepare("SELECT password_hash h FROM owners WHERE email = 'bob@x.com'").get().h;
+  const hashOf = async () => (await app.store.c('owners').one({ email: 'bob@x.com' })).password_hash;
+  const hash0 = await hashOf();
   assert.equal((await api('POST', '/api/auth/change-password', { body: { current_password: 'password123', new_password: 'newpass456' } })).status, 401, 'needs login');
   const bad = await api('POST', '/api/auth/change-password', { token: B, body: { current_password: 'wrong-one', new_password: 'newpass456' } });
   assert.equal(bad.status, 400); assert.match(bad.data.error, /current password/);
   assert.equal((await api('POST', '/api/auth/change-password', { token: B, body: { current_password: 'password123', new_password: 'short' } })).status, 400);
   assert.equal((await api('POST', '/api/auth/change-password', { token: B, body: { current_password: 'password123', new_password: 'password123' } })).status, 400);
-  assert.equal(app.db.prepare("SELECT password_hash h FROM owners WHERE email = 'bob@x.com'").get().h, hash0, 'nothing changed by the failed tries');
+  assert.equal(await hashOf(), hash0, 'nothing changed by the failed tries');
   const other = (await api('POST', '/api/auth/login', { body: { email: 'bob@x.com', password: 'password123' } })).data.token; // a second device
   const r = await api('POST', '/api/auth/change-password', { token: other, body: { current_password: 'password123', new_password: 'newpass456' } });
   assert.equal(r.status, 200);
-  const hash1 = app.db.prepare("SELECT password_hash h FROM owners WHERE email = 'bob@x.com'").get().h;
+  const hash1 = await hashOf();
   assert.notEqual(hash1, hash0);
   assert.match(hash1, /^scrypt\$/);
   assert.ok(!hash1.includes('newpass456'));
@@ -107,14 +110,14 @@ test('change password: needs the current one, updates the database hash, signs o
 });
 
 test('no sign-up on the website: closed by default, and the config does not offer it', async () => {
-  const closed = createApp({ dbFile: ':memory:', secret: 'x', provider: null });
+  const closed = await createApp({ ...dbOpts(), secret: 'x', provider: null });
   await new Promise((r) => closed.server.listen(0, r));
   const url = `http://localhost:${closed.server.address().port}`;
   const reg = await fetch(`${url}/api/auth/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'Eve', email: 'eve@x.com', password: 'password123' }) });
   assert.equal(reg.status, 403);
   const cfg = await (await fetch(`${url}/api/config`)).json();
   assert.equal('signup' in cfg, false);
-  closed.server.close();
+  closed.server.close(); await cleanup(closed.store);
 });
 
 test('booking: review popup first, nothing saved until confirmed; tokens use first 3 letters + number', async () => {
@@ -170,14 +173,14 @@ test('read tools: where are the rooms on a date, by token, by houseboat', async 
   assert.match(r.data.reply, /Cultural Palace/);
   // the tool result the model saw
   const { runReadTool } = await import('../server/tools.js');
-  const ctx = { db: app.db, ownerId: 1, tz: 'Asia/Kolkata' };
-  const byToken = runReadTool(ctx, 'list_bookings', { token: 'cul002' });
+  const ctx = { store: app.store, ownerId: 1, tz: 'Asia/Kolkata' };
+  const byToken = await runReadTool(ctx, 'list_bookings', { token: 'cul002' });
   assert.equal(byToken.length, 1);
   assert.equal(byToken[0].rooms.find((x) => x.token === 'CUL002').guests, 2);
-  const payables = runReadTool(ctx, 'get_payables', { houseboat_name: 'Cultural Palace' });
+  const payables = await runReadTool(ctx, 'get_payables', { houseboat_name: 'Cultural Palace' });
   assert.equal(payables.houseboats[0].pending, 16000);
   assert.equal(payables.by_booking[0].booking_id, 1);
-  const none = runReadTool(ctx, 'list_bookings', { date: D(30) });
+  const none = await runReadTool(ctx, 'list_bookings', { date: D(30) });
   assert.equal(none.length, 0);
 });
 
@@ -263,9 +266,10 @@ test('cancel booking frees tokens and reverses charges; received money becomes a
   await confirm(A, again.pending.token, false);
 });
 
-test('ledger is append-only (database refuses UPDATE and DELETE)', async () => {
-  assert.throws(() => app.db.prepare('UPDATE ledger SET amount = 1 WHERE id = 1').run(), /append-only|cannot|ledger/i);
-  assert.throws(() => app.db.prepare('DELETE FROM ledger WHERE id = 1').run(), /append-only|cannot|ledger/i);
+test('ledger is append-only (the data layer refuses UPDATE and DELETE)', async () => {
+  await assert.rejects(app.store.c('ledger').update({ id: 1 }, { $set: { amount: 1 } }), /append-only/);
+  await assert.rejects(app.store.c('ledger').updateMany({}, { $set: { amount: 1 } }), /append-only/);
+  await assert.rejects(app.store.c('ledger').remove({ id: 1 }), /append-only/);
   const rows = (await api('GET', '/api/balance', { token: A })).data.ledger;
   const pay = rows.find((l) => l.type === 'PAYMENT' && l.side === 'CLIENT');
   const r = await propose(A, 'reverse_ledger_entry', { ledger_id: pay.id, reason: 'typo' });
@@ -378,22 +382,6 @@ test('total rooms is enforced: no room number beyond it, and "full" on busy date
   assert.equal(shrink.status, 400);
   const hb = (await api('GET', '/api/houseboats', { token: A })).data.find((h) => h.prefix === 'LOT');
   assert.equal(hb.total_rooms, 4);
-});
-
-test('old v2 database gets the total_rooms column without losing data', async () => {
-  const { DatabaseSync } = await import('node:sqlite');
-  const { openDb } = await import('../server/db.js');
-  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bh-'));
-  const file = path.join(dir, 't.db');
-  const d = openDb(file);
-  d.exec("INSERT INTO owners(name,email,password_hash) VALUES('O','o@x.com','h'); INSERT INTO houseboats(owner_id,name,prefix) VALUES(1,'Old Boat','OLD');");
-  d.exec('ALTER TABLE houseboats DROP COLUMN total_rooms; PRAGMA user_version = 2;');
-  d.close();
-  const d2 = openDb(file);
-  assert.ok(d2.prepare('PRAGMA table_info(houseboats)').all().some((c) => c.name === 'total_rooms'));
-  assert.equal(d2.prepare('SELECT name FROM houseboats').get().name, 'Old Boat');
-  d2.close();
 });
 
 test('voice: /api/transcribe needs login, valid WAV, a provider; rate limited per owner', async () => {

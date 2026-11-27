@@ -7,8 +7,11 @@ const MAX_MESSAGE = 2000;
 
 /* ------------------------------ prompt ------------------------------ */
 
+const col = (ctx, name) => ctx.store.c(name);
+const nowIso = () => new Date().toISOString();
+
 function knownBoats(ctx) {
-  return ctx.db.prepare('SELECT name, prefix, is_own, total_rooms FROM houseboats WHERE owner_id = ? ORDER BY name').all(ctx.ownerId);
+  return col(ctx, 'houseboats').find({ owner_id: ctx.ownerId }, { sort: { name: 1 } });
 }
 
 // Shows the waiting booking back to the model in the same shape the tool accepts, so "change the price" edits work.
@@ -23,12 +26,12 @@ function pendingForPrompt(pending) {
 }
 
 // The newest price used for each houseboat + meal plan, so the bot can suggest it ("same as last time?").
-function lastPrices(ctx) {
-  const rows = ctx.db.prepare(
-    `SELECT h.name, br.meal_plan, br.price FROM booking_rooms br
-     JOIN bookings b ON b.id = br.booking_id JOIN houseboats h ON h.id = br.houseboat_id
-     WHERE b.owner_id = ? AND b.status = 'confirmed' AND br.price IS NOT NULL AND br.meal_plan IS NOT NULL
-     ORDER BY b.id DESC, br.id DESC LIMIT 200`).all(ctx.ownerId);
+async function lastPrices(ctx, boats) {
+  const live = new Set((await col(ctx, 'bookings').find({ owner_id: ctx.ownerId, status: 'confirmed' })).map((b) => b.id));
+  const name = new Map(boats.map((h) => [h.id, h.name]));
+  const rows = (await col(ctx, 'booking_rooms').find({ owner_id: ctx.ownerId, price: { $ne: null }, meal_plan: { $ne: null } }, { sort: { booking_id: -1, id: -1 } }))
+    .filter((r) => live.has(r.booking_id) && name.has(r.houseboat_id)).slice(0, 200)
+    .map((r) => ({ name: name.get(r.houseboat_id), meal_plan: r.meal_plan, price: r.price }));
   const seen = new Set(); const out = [];
   for (const r of rows) {
     const k = `${r.name}|${r.meal_plan}`;
@@ -39,11 +42,11 @@ function lastPrices(ctx) {
   return out;
 }
 
-function systemPrompt(ctx, pending) {
+async function systemPrompt(ctx, pending) {
   const today = todayStr(ctx.tz);
   const weekday = new Intl.DateTimeFormat('en-US', { timeZone: ctx.tz, weekday: 'long' }).format(new Date());
-  const boats = knownBoats(ctx);
-  const last = lastPrices(ctx);
+  const boats = await knownBoats(ctx);
+  const last = await lastPrices(ctx, boats);
   return `You are the assistant inside a houseboat booking-management dashboard. You are talking to the owner "${ctx.ownerName}". You can only see and change THIS owner's data, through the tools.
 
 HOW THE BUSINESS WORKS:
@@ -70,7 +73,7 @@ BOOKING A CLIENT (the main job):
 - To call create_booking you MUST know: client name, SENDER, check-in, check-out (or number of nights), and the houseboat of every room. Guests per room, price per night and meal plan per room are wanted but OPTIONAL: if the owner says "skip", "later", "not decided" or does not know, leave those fields out. The room is then saved with "details pending" and can be filled in later with update_room. Phone number is optional but ask for it.
 - NEVER call create_booking until the owner has told you the sender in this chat (a name, or "Direct"). Never fill the sender with the client's name, "Direct", "Not provided" or anything else just to get past the check. If the sender is missing, do NOT call any tool: ask for it in your reply, together with the other missing things.
 - Do not call tools to check rooms or availability before booking: the system checks that itself when you call create_booking. Do not call a tool only to ask a question.
-- Collect what is missing in ONE message, as a short numbered list, never one question at a time. Ask: client name, sender, phone, check-out date if missing, guests per room, price per room per night, meal plan per room. Tell the owner he can say "skip" for guests, price or meal plan. If the owner's own houseboat has no name yet, ask for it (a short name is fine, used for the token); if he does not want to name it use "Own".
+- Collect what is missing in ONE message, as a short numbered list, never one question at a time. Ask: client name, sender, phone, check-out date if missing, guests per room, price per room per night, meal plan per room, and whether a SHIKARA RIDE is included for each room (and if yes, its price per room). Tell the owner he can say "skip" for guests, price or meal plan. If the owner's own houseboat has no name yet, ask for it (a short name is fine, used for the token); if he does not want to name it use "Own".
 - Group questions by houseboat, for example "Chinar (2 rooms): guests in each room, price per night, meal plan?". Accept "same for all" answers and expand them to every room yourself.
 - If the client wants more rooms than are given now (for example "39 rooms needed, 31 allotted for now"), pass rooms_required (39) and put only the allocated rooms (31) in "rooms". Later rooms can be added with add_rooms.
 - As soon as everything required is known, call create_booking with one item in "rooms" for each room. The system then shows the owner a review popup with the tokens and asks for confirmation. Do not say the booking is saved.
@@ -80,7 +83,10 @@ BOOKING A CLIENT (the main job):
 CHANGING A SAVED BOOKING (each needs the owner's confirmation):
 - To add houseboats ("add Chinar, Blue Sky (mine), Purple Sky"), call add_houseboats ONCE with every houseboat named. Never tell the owner to use a button instead. If the room count of a new houseboat is not given, ask for it in the same message as your other questions (he can say skip). A booking may also use a new houseboat name directly: create_booking adds it.
 - delete_all_bookings wipes EVERY booking and money entry. Use it only when the owner clearly says to delete or clear all bookings / everything. To remove ONE booking completely (wrong or test booking: "delete booking 3", "booking 3 hata do") use delete_booking; to only cancel it and keep its record use cancel_booking. To remove a houseboat name ("delete Chinar", "Chinar hata do") use delete_houseboat; it works only if that houseboat has no bookings, otherwise explain that the bookings must be deleted or moved first. Ask which one if the owner just says "delete" without saying what.
-- update_room: guests, meal plan or price of ONE room, or filling in details that were skipped. set_meal_plans: meal plans of MANY rooms in ONE call. When the owner names meal plans for several houseboats ("on 28 December Flower Garden EP, Chinar CPI, Helen of Troy API") or says one plan for all rooms of a date or booking, call set_meal_plans ONCE with a "changes" item for EVERY houseboat he named; never use update_room for just the first one and forget the rest. update_booking: dates, sender, client name, phone, rooms_required. add_rooms: more rooms. remove_room: take one room out. move_room: shift a room to another houseboat. cancel_booking: cancel everything.
+- SHIKARA RIDE: every room has its own shikara ride setting: included (with a price) or not included. Pass shikara (true/false) and shikara_price per room in create_booking / add_rooms. The price is charged ONCE per room, not per night, and is added to the client total. If the owner says it is included but gives no price, ask "What is the shikara ride price per room?" before or right after saving (pass shikara true without shikara_price; it shows as price pending). If he did not say anything, leave it out: it shows as "shikara pending". For many rooms at once ("all rooms shikara included, 500 each", "no shikara for Chinar rooms") use set_shikara; for one room use update_room.
+- MANY ROOM CHANGES IN ONE MESSAGE: only ONE change card can be shown per message, so when the owner changes more than one room (different shikara prices per room, prices, guests, meal plans, on one or several houseboats) call update_rooms ONCE with an item for EVERY room he mentioned. Never change only the first room and drop the rest. "Pehle / dusre / teesre wale" (first / second / third) room of a houseboat = its tokens in order (PIN001, PIN002, PIN003). If you do not know the tokens, call list_bookings first, then update_rooms. Example: "Pink ke teen shikara: pehle 600, dusre 800, teesre 700" -> update_rooms changes [{token PIN001, shikara true, shikara_price 600}, {token PIN002, shikara true, shikara_price 800}, {token PIN003, shikara true, shikara_price 700}].
+- If one message asks for two different kinds of change (for example rooms AND a payment), make the first change now and tell the owner you will do the second right after he confirms.
+- update_room: guests, meal plan, price or shikara ride of ONE room, or filling in details that were skipped. set_meal_plans: meal plans of MANY rooms in ONE call. When the owner names meal plans for several houseboats ("on 28 December Flower Garden EP, Chinar CPI, Helen of Troy API") or says one plan for all rooms of a date or booking, call set_meal_plans ONCE with a "changes" item for EVERY houseboat he named; never use update_room for just the first one and forget the rest. update_booking: dates, sender, client name, phone, rooms_required. add_rooms: more rooms. remove_room: take one room out. move_room: shift a room to another houseboat. cancel_booking: cancel everything.
 
 ANSWERING QUESTIONS (always call a tool, never guess):
 - "How many rooms in Chinar on 28 Dec", "how many MAP rooms", "rooms from ABC Travels": count_rooms. "How many rooms are vacant / free": vacant_rooms (it needs the houseboat total rooms; if a houseboat has none set, ask how many rooms it has and save it with add_houseboats). Revenue, billing, monthly report: revenue_report. Clients or senders and what they owe: people_summary. Which bookings came from a sender, or have details pending: list_bookings (sender, details_pending).
@@ -97,52 +103,55 @@ OTHER RULES:
 
 /* --------------------------- pending actions --------------------------- */
 
-function getPending(ctx, conversationId) {
-  const row = ctx.db
-    .prepare("SELECT * FROM pending_actions WHERE owner_id = ? AND conversation_id = ? AND status = 'pending' ORDER BY created_at DESC LIMIT 1")
-    .get(ctx.ownerId, conversationId);
+const setStatus = (ctx, token, status) => col(ctx, 'pending_actions').update({ _id: token, owner_id: ctx.ownerId }, { $set: { status } });
+
+async function getPending(ctx, conversationId) {
+  const row = await col(ctx, 'pending_actions').one({ owner_id: ctx.ownerId, conversation_id: conversationId, status: 'pending' }, { sort: { created_at: -1 } });
   if (!row) return null;
   if (new Date(row.expires_at).getTime() < Date.now()) {
-    ctx.db.prepare("UPDATE pending_actions SET status = 'expired' WHERE token = ?").run(row.token);
+    await setStatus(ctx, row.token, 'expired');
     return null;
   }
   return row;
 }
 
-export function createPending(ctx, conversationId, tool, args, summary, preview) {
-  ctx.db.prepare("UPDATE pending_actions SET status = 'cancelled' WHERE owner_id = ? AND conversation_id = ? AND status = 'pending'").run(ctx.ownerId, conversationId);
+export async function createPending(ctx, conversationId, tool, args, summary, preview) {
+  await col(ctx, 'pending_actions').updateMany({ owner_id: ctx.ownerId, conversation_id: conversationId, status: 'pending' }, { $set: { status: 'cancelled' } });
   const token = crypto.randomBytes(16).toString('hex');
-  ctx.db
-    .prepare('INSERT INTO pending_actions(token, owner_id, conversation_id, tool, args_json, summary, preview_json, expires_at) VALUES(?,?,?,?,?,?,?,?)')
-    .run(token, ctx.ownerId, conversationId, tool, JSON.stringify(args), summary, preview ? JSON.stringify(preview) : null, new Date(Date.now() + PENDING_TTL_MS).toISOString());
+  await col(ctx, 'pending_actions').insert({ _id: token, token, owner_id: ctx.ownerId, conversation_id: conversationId, tool, args_json: JSON.stringify(args), summary, preview_json: preview ? JSON.stringify(preview) : null, status: 'pending', expires_at: new Date(Date.now() + PENDING_TTL_MS).toISOString() });
   return { token, summary, preview: preview || null, tool };
 }
 
-export function saveMessage(ctx, conversationId, role, content, meta = null) {
-  ctx.db.prepare('INSERT INTO messages(conversation_id, owner_id, role, content, meta) VALUES(?,?,?,?,?)').run(conversationId, ctx.ownerId, role, content, meta ? JSON.stringify(meta) : null);
-  ctx.db.prepare("UPDATE conversations SET updated_at = datetime('now') WHERE id = ?").run(conversationId);
+export async function saveMessage(ctx, conversationId, role, content, meta = null) {
+  await col(ctx, 'messages').insert({ conversation_id: conversationId, owner_id: ctx.ownerId, role, content, meta: meta ? JSON.stringify(meta) : null });
+  await col(ctx, 'conversations').update({ id: conversationId, owner_id: ctx.ownerId }, { $set: { updated_at: nowIso() } });
 }
 
 // Approve or cancel a waiting change. Used by the Confirm button and by a spoken/typed "yes".
-export function resolvePending(ctx, token, approve) {
-  const row = ctx.db.prepare('SELECT * FROM pending_actions WHERE token = ? AND owner_id = ?').get(token, ctx.ownerId);
+export async function resolvePending(ctx, token, approve) {
+  const row = await col(ctx, 'pending_actions').one({ _id: String(token), owner_id: ctx.ownerId });
   if (!row) throw new ToolError('That confirmation was not found.');
-  if (row.status !== 'pending') return { status: row.status, message: `That request is already ${row.status}.`, changed: false, conversationId: row.conversation_id };
+  const STUCK_MS = 2 * 60 * 1000; // a save that never finished (server stopped mid-way) may be tried again after 2 minutes
+  const stuck = row.status === 'saving' && Date.parse(row.saving_at || 0) < Date.now() - STUCK_MS;
+  if (row.status !== 'pending' && !stuck) return { status: row.status === 'saving' ? 'pending' : row.status, message: row.status === 'saving' ? 'That request is being saved right now.' : `That request is already ${row.status}.`, changed: false, conversationId: row.conversation_id };
   if (new Date(row.expires_at).getTime() < Date.now()) {
-    ctx.db.prepare("UPDATE pending_actions SET status = 'expired' WHERE token = ?").run(token);
+    await setStatus(ctx, token, 'expired');
     return { status: 'expired', message: 'That request expired. Please ask again.', changed: false, conversationId: row.conversation_id };
   }
   if (!approve) {
-    ctx.db.prepare("UPDATE pending_actions SET status = 'cancelled' WHERE token = ?").run(token);
+    await setStatus(ctx, token, 'cancelled');
     return { status: 'cancelled', message: 'Okay, cancelled. Nothing was changed.', changed: false, conversationId: row.conversation_id };
   }
+  // Mark it used first, so a double tap on Confirm can never save the same booking twice.
+  const claimed = await col(ctx, 'pending_actions').update({ _id: token, owner_id: ctx.ownerId, status: row.status, ...(row.status === 'saving' ? { saving_at: row.saving_at } : {}) }, { $set: { status: 'saving', saving_at: nowIso() } });
+  if (!claimed) return { status: 'pending', message: 'That request is being saved right now.', changed: false, conversationId: row.conversation_id };
   try {
-    const { message } = executeWrite(ctx, row.tool, JSON.parse(row.args_json));
-    ctx.db.prepare("UPDATE pending_actions SET status = 'confirmed' WHERE token = ?").run(token);
+    const { message } = await executeWrite(ctx, row.tool, JSON.parse(row.args_json));
+    await setStatus(ctx, token, 'confirmed');
     return { status: 'confirmed', message, changed: true, conversationId: row.conversation_id };
   } catch (e) {
-    if (!(e instanceof ToolError)) throw e;
-    ctx.db.prepare("UPDATE pending_actions SET status = 'failed' WHERE token = ?").run(token);
+    if (!(e instanceof ToolError)) { await setStatus(ctx, token, 'pending'); throw e; }
+    await setStatus(ctx, token, 'failed');
     return { status: 'failed', message: `Could not save: ${e.message}`, changed: false, conversationId: row.conversation_id };
   }
 }
@@ -165,26 +174,26 @@ const NO = new Set(['no', 'n', 'nope', 'cancel', 'stop', 'nahi', 'nahin', 'na', 
 
 /* --------------------- simple mode (no AI / AI down) --------------------- */
 
-function simpleMode(ctx, text) {
+async function simpleMode(ctx, text) {
   const t = devanagariDigitsToAscii(text).toLowerCase();
   const today = todayStr(ctx.tz);
-  const run = (name, args = {}) => { const tool = TOOL_MAP.get(name); return tool.format(runReadTool(ctx, name, args)); };
+  const run = async (name, args = {}) => { const tool = TOOL_MAP.get(name); return tool.format(await runReadTool(ctx, name, args)); };
   try {
     const token = text.match(/\b([A-Za-z]{3}\d{3})\b/);
-    if (token) return run('list_bookings', { token: token[1] });
+    if (token) return await run('list_bookings', { token: token[1] });
     const dates = parseLooseDates(text, today);
-    if (dates.length && /vacant|empty|free|khali|खाली/.test(t)) return run('vacant_rooms', { date: dates[0] });
-    if (dates.length && /how many|kitne|कितने|count/.test(t)) return run('count_rooms', { date: dates[0] });
+    if (dates.length && /vacant|empty|free|khali|खाली/.test(t)) return await run('vacant_rooms', { date: dates[0] });
+    if (dates.length && /how many|kitne|कितने|count/.test(t)) return await run('count_rooms', { date: dates[0] });
     if (/revenue|report|billing|income|कमाई|रिपोर्ट/.test(t)) {
       const mi = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'].findIndex((m) => new RegExp(`\\b${m}`).test(t));
-      return run('revenue_report', { month: mi >= 0 ? `${today.slice(0, 4)}-${String(mi + 1).padStart(2, '0')}` : today.slice(0, 7) });
+      return await run('revenue_report', { month: mi >= 0 ? `${today.slice(0, 4)}-${String(mi + 1).padStart(2, '0')}` : today.slice(0, 7) });
     }
-    if (/pending details|details pending|skipped/.test(t)) return run('list_bookings', { details_pending: true, status: 'confirmed' });
-    if (dates.length && /room|booking|client|kahan|kaha|where|who|कहाँ|कहां|कमरे|बुकिंग|क्लाइंट/.test(t)) return run('list_bookings', { date: dates[0], status: 'confirmed' });
-    if (/payable|pay to|palace|houseboat|hauseboat|देना|हाउसबोट|पैलेस/.test(t)) return run('get_payables');
-    if (/balance|due|outstanding|baki|baaki|hisab|hisaab|payment|money|बैलेंस|हिसाब|बाकी|बकाया|भुगतान|पैसे/.test(t)) return run('get_balance');
-    if (/booking|arrival|aane wale|बुकिंग/.test(t)) return run('list_bookings', { status: 'confirmed' });
-    if (/summary|dashboard|today|aaj|overview|सारांश|समरी|डैशबोर्ड|आज/.test(t)) return run('dashboard_summary');
+    if (/pending details|details pending|skipped/.test(t)) return await run('list_bookings', { details_pending: true, status: 'confirmed' });
+    if (dates.length && /room|booking|client|kahan|kaha|where|who|कहाँ|कहां|कमरे|बुकिंग|क्लाइंट/.test(t)) return await run('list_bookings', { date: dates[0], status: 'confirmed' });
+    if (/payable|pay to|palace|houseboat|hauseboat|देना|हाउसबोट|पैलेस/.test(t)) return await run('get_payables');
+    if (/balance|due|outstanding|baki|baaki|hisab|hisaab|payment|money|बैलेंस|हिसाब|बाकी|बकाया|भुगतान|पैसे/.test(t)) return await run('get_balance');
+    if (/booking|arrival|aane wale|बुकिंग/.test(t)) return await run('list_bookings', { status: 'confirmed' });
+    if (/summary|dashboard|today|aaj|overview|सारांश|समरी|डैशबोर्ड|आज/.test(t)) return await run('dashboard_summary');
   } catch (e) {
     if (e instanceof ToolError) return e.message;
     throw e;
@@ -194,8 +203,8 @@ function simpleMode(ctx, text) {
 
 /* ------------------------------ AI loop ------------------------------ */
 
-function historyFor(ctx, conversationId) {
-  const rows = ctx.db.prepare('SELECT role, content FROM messages WHERE conversation_id = ? AND owner_id = ? ORDER BY id DESC LIMIT 14').all(conversationId, ctx.ownerId).reverse();
+async function historyFor(ctx, conversationId) {
+  const rows = (await col(ctx, 'messages').find({ conversation_id: conversationId, owner_id: ctx.ownerId }, { sort: { id: -1 }, limit: 14 })).reverse();
   const contents = rows.filter((r) => r.content).map((r) => ({ role: r.role === 'assistant' ? 'model' : 'user', parts: [{ text: r.content }] }));
   while (contents.length && contents[0].role !== 'user') contents.shift();
   return contents;
@@ -208,30 +217,56 @@ function askOwnerText(message, fc) {
   if (a.client_name) known.push(`client ${a.client_name}`);
   if (a.check_in && a.check_out) known.push(`${a.check_in} to ${a.check_out}`);
   if (Array.isArray(a.rooms) && a.rooms.length) known.push(`${a.rooms.length} room${a.rooms.length > 1 ? 's' : ''}`);
-  return `${known.length ? `Got it (${known.join(', ')}). ` : ''}${message}\nYou can also add the guests in each room and the client's phone number, or say "skip".`;
+  return `${known.length ? `Got it (${known.join(', ')}). ` : ''}${message}\nYou can also add the guests in each room, the shikara ride (included or not, and its price) and the client's phone number, or say "skip".`;
+}
+
+// The AI sometimes answers with several room calls at once (update_room x3, set_shikara + update_room...).
+// Only one card fits a message, so those are joined into ONE update_rooms call and nothing is lost.
+const ROOM_CALLS = new Set(['update_room', 'update_rooms', 'set_shikara']);
+function mergeRoomCalls(calls) {
+  const room = calls.filter((c) => ROOM_CALLS.has(c.name));
+  if (room.length < 2) return calls;
+  const changes = [];
+  for (const c of room) {
+    const a = c.args || {};
+    if (c.name === 'update_room') {
+      const { booking_id, token, guests, meal_plan, price, partner_price, shikara, shikara_price } = a;
+      changes.push({ booking_id, token, guests, meal_plan, price, partner_price, shikara, shikara_price });
+    } else if (c.name === 'set_shikara') {
+      changes.push({ booking_id: a.booking_id, tokens: a.tokens, houseboat: a.houseboat, shikara: a.included, shikara_price: a.price });
+    } else for (const ch of a.changes || []) changes.push({ booking_id: a.booking_id, ...ch });
+  }
+  const merged = { name: 'update_rooms', args: { changes: changes.map((x) => Object.fromEntries(Object.entries(x).filter(([, v]) => v !== undefined))) } };
+  const out = []; let done = false;
+  for (const c of calls) {
+    if (!ROOM_CALLS.has(c.name)) out.push(c);
+    else if (!done) { out.push(merged); done = true; }
+  }
+  return out;
 }
 
 async function aiTurn(ctx, provider, conversationId, pendingRow) {
-  const contents = historyFor(ctx, conversationId);
-  const system = systemPrompt(ctx, pendingRow);
+  const contents = await historyFor(ctx, conversationId);
+  const system = await systemPrompt(ctx, pendingRow);
   const tools = toolDeclarations();
   let lastError = null; // the newest tool error, so a stuck loop can still give the owner a useful answer
   for (let i = 0; i < 5; i++) {
     const out = await provider.generate({ system, contents, tools });
     if (!out.functionCalls.length) return { text: out.text || 'Sorry, I did not get that. Could you say it again?' };
     contents.push({ role: 'model', parts: out.parts });
+    const calls = mergeRoomCalls(out.functionCalls);
     const responses = [];
     let card = null;
-    for (const fc of out.functionCalls) {
+    for (const fc of calls) {
       let response;
       try {
         const tool = TOOL_MAP.get(fc.name);
         if (!tool) throw new ToolError(`Unknown tool ${fc.name}.`);
-        if (!tool.write) response = { result: runReadTool(ctx, fc.name, fc.args) };
-        else if (card) response = { error: 'Only one change can be proposed per message.' };
+        if (!tool.write) response = { result: await runReadTool(ctx, fc.name, fc.args) };
+        else if (card) response = { error: 'Only one change card can be shown per message. Room changes must all go in ONE update_rooms call. Tell the owner this other change will be done right after he confirms the first one.' };
         else {
-          const prep = prepareWriteTool(ctx, fc.name, fc.args);
-          card = createPending(ctx, conversationId, fc.name, prep.args, prep.summary, prep.preview);
+          const prep = await prepareWriteTool(ctx, fc.name, fc.args);
+          card = await createPending(ctx, conversationId, fc.name, prep.args, prep.summary, prep.preview);
           response = { status: 'WAITING_FOR_OWNER_CONFIRMATION', summary: prep.summary };
         }
       } catch (e) {
@@ -255,21 +290,39 @@ async function aiTurn(ctx, provider, conversationId, pendingRow) {
 /* ------------------------------ entry point ------------------------------ */
 
 // Every owner has exactly one running chat.
-export function mainConversation(ctx) {
-  const row = ctx.db.prepare('SELECT id FROM conversations WHERE owner_id = ? ORDER BY id LIMIT 1').get(ctx.ownerId);
+export async function mainConversation(ctx) {
+  const row = await col(ctx, 'conversations').one({ owner_id: ctx.ownerId }, { sort: { id: 1 } });
   if (row) return row.id;
-  return Number(ctx.db.prepare('INSERT INTO conversations(owner_id) VALUES(?)').run(ctx.ownerId).lastInsertRowid);
+  return (await col(ctx, 'conversations').insert({ owner_id: ctx.ownerId, title: 'Chat', updated_at: nowIso() })).id;
 }
 
-export function loadHistory(ctx, limit = 80) {
-  const conv = mainConversation(ctx);
-  const msgs = ctx.db.prepare('SELECT id, role, content, meta FROM (SELECT * FROM messages WHERE conversation_id = ? AND owner_id = ? ORDER BY id DESC LIMIT ?) ORDER BY id').all(conv, ctx.ownerId, limit);
-  const statusOf = ctx.db.prepare('SELECT status, expires_at FROM pending_actions WHERE token = ? AND owner_id = ?');
+// Old chat clears itself: once the last message is older than ctx.chatCleanSeconds, the messages are deleted
+// (bookings and money are never touched). Not while a confirm card is still waiting, so a booking under review never vanishes.
+export async function autoClean(ctx, conv) {
+  const secs = ctx.chatCleanSeconds;
+  if (!secs) return false;
+  const last = await col(ctx, 'messages').one({ conversation_id: conv, owner_id: ctx.ownerId }, { sort: { id: -1 } });
+  if (!last) return false;
+  const now = ctx.now ? ctx.now() : Date.now();
+  if (now - Date.parse(last.created_at) < secs * 1000) return false;
+  const waiting = await col(ctx, 'pending_actions').one({ owner_id: ctx.ownerId, conversation_id: conv, status: { $in: ['pending', 'saving'] }, expires_at: { $gt: new Date(now).toISOString() } });
+  if (waiting) return false;
+  await col(ctx, 'messages').remove({ conversation_id: conv, owner_id: ctx.ownerId });
+  return true;
+}
+
+export async function loadHistory(ctx, limit = 80) {
+  const conv = await mainConversation(ctx);
+  await autoClean(ctx, conv);
+  const msgs = (await col(ctx, 'messages').find({ conversation_id: conv, owner_id: ctx.ownerId }, { sort: { id: -1 }, limit })).reverse();
+  const tokens = msgs.map((m) => (m.meta ? JSON.parse(m.meta) : null)?.pending?.token).filter(Boolean);
+  const pend = new Map((tokens.length ? await col(ctx, 'pending_actions').find({ owner_id: ctx.ownerId, _id: { $in: tokens } }) : []).map((r) => [r.token, r]));
   return msgs.map((m) => {
     const meta = m.meta ? JSON.parse(m.meta) : null;
     if (meta?.pending) {
-      const row = statusOf.get(meta.pending.token, ctx.ownerId);
+      const row = pend.get(meta.pending.token);
       let status = row?.status || 'expired';
+      if (status === 'saving') status = 'pending';
       if (status === 'pending' && new Date(row.expires_at).getTime() < Date.now()) status = 'expired';
       meta.pending.status = status;
     }
@@ -277,27 +330,28 @@ export function loadHistory(ctx, limit = 80) {
   });
 }
 
-export function clearHistory(ctx) {
-  const conv = mainConversation(ctx);
-  ctx.db.prepare("UPDATE pending_actions SET status = 'cancelled' WHERE owner_id = ? AND status = 'pending'").run(ctx.ownerId);
-  ctx.db.prepare('DELETE FROM messages WHERE conversation_id = ? AND owner_id = ?').run(conv, ctx.ownerId);
+export async function clearHistory(ctx) {
+  const conv = await mainConversation(ctx);
+  await col(ctx, 'pending_actions').updateMany({ owner_id: ctx.ownerId, status: 'pending' }, { $set: { status: 'cancelled' } });
+  await col(ctx, 'messages').remove({ conversation_id: conv, owner_id: ctx.ownerId });
 }
 
 export async function handleChat(ctx, provider, rawText) {
   const text = String(rawText || '').trim().slice(0, MAX_MESSAGE);
   if (!text) throw new ToolError('Please type or say something.');
-  const conversationId = mainConversation(ctx);
-  saveMessage(ctx, conversationId, 'user', text);
+  const conversationId = await mainConversation(ctx);
+  await autoClean(ctx, conversationId); // an old, finished chat does not confuse the AI
+  await saveMessage(ctx, conversationId, 'user', text);
 
-  const pendingRow = getPending(ctx, conversationId);
+  const pendingRow = await getPending(ctx, conversationId);
 
   // A plain "yes" / "haan" / "no" answers the waiting confirmation card, without asking the AI.
   if (pendingRow) {
     const n = norm(text);
     const verdict = YES.has(n) ? true : NO.has(n) ? false : null;
     if (verdict !== null) {
-      const r = resolvePending(ctx, pendingRow.token, verdict);
-      saveMessage(ctx, conversationId, 'assistant', r.message, { resolved: pendingRow.token, status: r.status });
+      const r = await resolvePending(ctx, pendingRow.token, verdict);
+      await saveMessage(ctx, conversationId, 'assistant', r.message, { resolved: pendingRow.token, status: r.status });
       return { reply: r.message, changed: r.changed, resolved: { token: pendingRow.token, status: r.status } };
     }
   }
@@ -305,20 +359,20 @@ export async function handleChat(ctx, provider, rawText) {
   if (isDeleteAll(text)) {
     let reply; let card = null;
     try {
-      const prep = prepareWriteTool(ctx, 'delete_all_bookings', {});
-      card = createPending(ctx, conversationId, 'delete_all_bookings', prep.args, prep.summary, prep.preview);
+      const prep = await prepareWriteTool(ctx, 'delete_all_bookings', {});
+      card = await createPending(ctx, conversationId, 'delete_all_bookings', prep.args, prep.summary, prep.preview);
       reply = 'Please confirm. This will delete ALL your bookings and money entries for good:';
     } catch (e) {
       if (!(e instanceof ToolError)) throw e;
       reply = e.message;
     }
-    saveMessage(ctx, conversationId, 'assistant', reply, card ? { pending: card } : null);
+    await saveMessage(ctx, conversationId, 'assistant', reply, card ? { pending: card } : null);
     return { reply, pending: card, changed: false, simple: false };
   }
 
   let result;
   if (!provider) {
-    result = { text: simpleMode(ctx, text), simple: true };
+    result = { text: await simpleMode(ctx, text), simple: true };
   } else {
     try {
       result = await aiTurn(ctx, provider, conversationId, pendingRow);
@@ -330,10 +384,10 @@ export async function handleChat(ctx, provider, rawText) {
       // Show the real reason so a failing connection can be fixed quickly (no secrets are in this text).
       const cause = e?.cause?.code || e?.cause?.message;
       const why = e?.status ? `Gemini HTTP ${e.status}: ${String(e.detail || e.message).replace(/\s+/g, ' ').slice(0, 260)}` : `${e?.name || 'Error'}: ${String(e?.message || e).slice(0, 200)}${cause ? ` (${cause})` : ''}`;
-      result = { text: `${prefix}\nReason: ${why}\n${simpleMode(ctx, text)}`, simple: true };
+      result = { text: `${prefix}\nReason: ${why}\n${await simpleMode(ctx, text)}`, simple: true };
     }
   }
-  saveMessage(ctx, conversationId, 'assistant', result.text, result.pending ? { pending: result.pending } : null);
+  await saveMessage(ctx, conversationId, 'assistant', result.text, result.pending ? { pending: result.pending } : null);
   return { reply: result.text, pending: result.pending || null, changed: false, simple: Boolean(result.simple) };
 }
 
