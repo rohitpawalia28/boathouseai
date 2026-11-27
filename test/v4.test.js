@@ -497,3 +497,33 @@ test('overpaid houseboat: dashboard can reverse the wrong payment and the balanc
   const bad = await api('POST', '/api/delete-request', { body: { kind: 'entry', id: 99999 } });
   assert.equal(bad.status >= 400, true);
 });
+
+test('add_houseboats: the AI adds many houseboats in one confirmation (own + partner, rooms optional)', async () => {
+  const reg = await api('POST', '/api/auth/register', { token: null, body: { name: 'Boat Adder', email: 'adder@x.com', password: 'password123' } });
+  const t = reg.data.token;
+  const prop = async (args) => { ai.queue.push(call('add_houseboats', args)); return (await api('POST', '/api/chat', { token: t, body: { message: 'add boats' } })).data; };
+  const conf = (tok) => api('POST', '/api/confirm', { token: t, body: { token: tok, approve: true } });
+  const boatsNow = async () => Object.fromEntries((await api('GET', '/api/houseboats', { token: t })).data.map((b) => [b.name, b]));
+  const p = await prop({ houseboats: [{ name: 'Chinar' }, { name: 'Blue Sky', own: true, total_rooms: 4 }, { name: 'Purple Sky', total_rooms: 3 }, { name: 'Red Sky', total_rooms: 5 }, { name: 'red  sky' }] });
+  assert.ok(p.pending?.token, JSON.stringify(p));
+  assert.equal(Object.keys(await boatsNow()).length, 0, 'nothing is saved before confirming');
+  const r = await conf(p.pending.token);
+  assert.equal(r.data.status, 'confirmed', r.data.message);
+  assert.match(r.data.message, /Added Chinar .*Blue Sky .*Purple Sky .*Red Sky/);
+  const by = await boatsNow();
+  assert.equal(Object.keys(by).length, 4, 'duplicate "red  sky" is added once');
+  assert.equal(by['Blue Sky'].total_rooms, 4); assert.ok(by['Blue Sky'].is_own);
+  assert.ok(!by.Chinar.is_own); assert.equal(by.Chinar.total_rooms, null);
+  // later: set room counts; Blue Sky stays "own" when not mentioned again
+  const p2 = await prop({ houseboats: [{ name: 'chinar', total_rooms: 5 }, { name: 'Blue Sky', total_rooms: 5 }] });
+  assert.equal((await conf(p2.pending.token)).data.status, 'confirmed');
+  const by2 = await boatsNow();
+  assert.equal(by2.Chinar.total_rooms, 5); assert.equal(by2['Blue Sky'].total_rooms, 5); assert.ok(by2['Blue Sky'].is_own);
+  // a 9-room houseboat gets no card
+  ai.queue.length = 0;
+  ai.queue.push(call('add_houseboats', { houseboats: [{ name: 'Huge Boat', total_rooms: 9 }] }), say('A houseboat has at most 5 rooms.'));
+  const bad = await api('POST', '/api/chat', { token: t, body: { message: 'add Huge Boat 9 rooms' } });
+  assert.ok(!bad.data.pending);
+  assert.ok(!(await boatsNow())['Huge Boat']);
+  ai.queue.length = 0;
+});

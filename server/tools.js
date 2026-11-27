@@ -62,14 +62,28 @@ function makePrefix(ctx, name, taken = new Set()) {
 }
 
 // Used by the dashboard "Add houseboat" button. Adding an existing name just updates its room count.
-export function addHouseboat(ctx, { name, total_rooms, is_own }) {
+export function addHouseboat(ctx, args) {
+  return tx(ctx.db, () => saveHouseboat(ctx, args));
+}
+
+// Checks and saves one houseboat (no transaction of its own, so a chat tool can add several in one go).
+function cleanBoat(ctx, { name, total_rooms }) {
+  name = String(name || '').trim().replace(/\s+/g, ' ');
+  if (name.length < 2 || name.length > 60) throw new ToolError('Please enter a houseboat name (2 to 60 letters).');
+  if (!/[A-Za-z]{2}/.test(name)) throw new ToolError(`"${name}": the name needs at least two English letters (they make the room tokens, like CUL001).`);
+  const rooms = total_rooms === undefined || total_rooms === null || total_rooms === '' ? null : Number(total_rooms);
+  if (rooms !== null && (!Number.isInteger(rooms) || rooms < 1 || rooms > MAX_ROOMS_PER_BOAT)) throw new ToolError(`${name}: a houseboat has 1 to ${MAX_ROOMS_PER_BOAT} rooms (usually 3 or 4).`);
+  return { name, rooms };
+}
+
+function saveHouseboat(ctx, { name, total_rooms, is_own }) {
   name = String(name || '').trim().replace(/\s+/g, ' ');
   if (name.length < 2 || name.length > 60) throw new ToolError('Please enter a houseboat name (2 to 60 letters).');
   if (!/[A-Za-z]{2}/.test(name)) throw new ToolError('The name needs at least two English letters (they make the room tokens, like CUL001).');
   const rooms = total_rooms === undefined || total_rooms === null || total_rooms === '' ? null : Number(total_rooms);
   if (rooms !== null && (!Number.isInteger(rooms) || rooms < 1 || rooms > MAX_ROOMS_PER_BOAT)) throw new ToolError(`A houseboat has 1 to ${MAX_ROOMS_PER_BOAT} rooms (usually 3 or 4). Please enter a whole number up to ${MAX_ROOMS_PER_BOAT}.`);
   const existing = ctx.db.prepare('SELECT * FROM houseboats WHERE owner_id = ? AND name = ? COLLATE NOCASE').get(ctx.ownerId, name);
-  return tx(ctx.db, () => {
+  return (() => {
     if (existing) {
       if (rooms !== null) {
         const maxUsed = ctx.db.prepare('SELECT COALESCE(MAX(room_no),0) m FROM booking_rooms br JOIN bookings b ON b.id = br.booking_id WHERE br.houseboat_id = ? AND b.status = \'confirmed\' AND b.check_out >= ?').get(existing.id, todayStr(ctx.tz)).m;
@@ -83,7 +97,7 @@ export function addHouseboat(ctx, { name, total_rooms, is_own }) {
     const id = Number(ctx.db.prepare('INSERT INTO houseboats(owner_id, name, prefix, is_own, total_rooms) VALUES(?,?,?,?,?)').run(ctx.ownerId, name, prefix, is_own ? 1 : 0, rooms).lastInsertRowid);
     ctx.db.prepare('INSERT INTO audit_log(owner_id, action, detail) VALUES(?,?,?)').run(ctx.ownerId, 'add_houseboat', JSON.stringify({ name, rooms }));
     return { id, name, prefix, total_rooms: rooms, is_own: !!is_own, updated: false };
-  });
+  })();
 }
 
 /* ------------------------------------------------------------------ */
@@ -1271,6 +1285,46 @@ export const TOOLS = [
       return out;
     },
     confirmText: (r) => `Done. Booking #${r.booking_id} (${r.client}) was deleted with its ${r.rooms} room${r.rooms === 1 ? '' : 's'} and ${r.entries} money entr${r.entries === 1 ? 'y' : 'ies'}. Its room tokens are free.`,
+  },
+  {
+    name: 'add_houseboats',
+    description: 'Add one or MANY houseboats to the owner\'s list in ONE call (e.g. "add Chinar, Blue Sky (mine), Purple Sky and Red Sky"). Also use it to change the room count of a houseboat or mark it as the owner\'s own. Ask how many rooms each has (3 to 5) if the owner did not say; if he says skip, leave total_rooms out. A booking can also use a new houseboat name directly, so this is not needed before create_booking.',
+    write: true,
+    parameters: {
+      type: 'object',
+      properties: {
+        houseboats: {
+          type: 'array',
+          description: 'One item per houseboat the owner named',
+          items: { type: 'object', properties: { name: S('Houseboat name as the owner says it'), total_rooms: I('Number of rooms (1 to 5), if known'), own: { type: 'boolean', description: 'true if it belongs to the owner himself ("mine", "apna", "own")' } }, required: ['name'] },
+        },
+      },
+      required: ['houseboats'],
+    },
+    prepare(ctx, a) {
+      const list = (a.houseboats || []).filter(Boolean);
+      if (!list.length) throw new ToolError('Which houseboats should I add?');
+      if (list.length > 30) throw new ToolError('Please add at most 30 houseboats at a time.');
+      const seen = new Set(); const items = []; const lns = [];
+      for (const b of list) {
+        const { name, rooms } = cleanBoat(ctx, { name: b.name, total_rooms: b.total_rooms });
+        if (seen.has(name.toLowerCase())) continue;
+        seen.add(name.toLowerCase());
+        const old = ctx.db.prepare('SELECT * FROM houseboats WHERE owner_id = ? AND name = ? COLLATE NOCASE').get(ctx.ownerId, name);
+        const own = b.own === undefined || b.own === null ? Boolean(old?.is_own) : b.own === true; // an existing boat keeps its own/partner setting unless told
+        const size = rooms ? `${rooms} room${rooms === 1 ? '' : 's'}` : (old?.total_rooms ? `${old.total_rooms} rooms` : 'rooms not set');
+        lns.push(old ? `${old.name}: already in your list, will be updated (${size}${own ? ', your own' : ''}).` : `${name}: ${size}, ${own ? 'your own houseboat' : 'partner houseboat'}.`);
+        items.push({ name: old ? old.name : name, total_rooms: rooms ?? undefined, own });
+      }
+      const fresh = items.filter((i) => !ctx.db.prepare('SELECT 1 FROM houseboats WHERE owner_id = ? AND name = ? COLLATE NOCASE').get(ctx.ownerId, i.name)).length;
+      const title = fresh === items.length ? `Add ${items.length} houseboat${items.length === 1 ? '' : 's'}?` : `Save ${items.length} houseboat${items.length === 1 ? '' : 's'}?`;
+      return { args: { houseboats: items }, summary: lines(title, lns), preview: { kind: 'simple', title, headline: items.map((i) => i.name).join(', '), lines: lns } };
+    },
+    run(ctx, a) {
+      const out = a.houseboats.map((b) => saveHouseboat(ctx, { name: b.name, total_rooms: b.total_rooms, is_own: b.own }));
+      return { added: out.filter((r) => !r.updated).map((r) => `${r.name} (${r.prefix})`), updated: out.filter((r) => r.updated).map((r) => r.name) };
+    },
+    confirmText: (r) => `Done. ${[r.added.length ? `Added ${r.added.join(', ')}.` : '', r.updated.length ? `Updated ${r.updated.join(', ')}.` : ''].filter(Boolean).join(' ')} Room tokens use the 3 letters in brackets.`,
   },
   {
     name: 'delete_houseboat',
