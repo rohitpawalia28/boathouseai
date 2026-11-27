@@ -31,7 +31,7 @@ async function makeCustomer(over = {}) {
 }
 
 before(async () => {
-  app = createApp({ chatPerMinute: 100000, dbFile: ':memory:', secret: 'test-secret', provider: sharedAi, providerFactory: keyed, now: () => clock });
+  app = createApp({ chatPerMinute: 100000, loginsPerWindow: 100000, dbFile: ':memory:', secret: 'test-secret', provider: sharedAi, providerFactory: keyed, now: () => clock });
   await new Promise((r) => app.server.listen(0, r));
   base = `http://localhost:${app.server.address().port}`;
   app.db.prepare("INSERT INTO owners(name, email, password_hash, role, plan) VALUES('Admin','admin@x.com',?,'admin','full')").run(await hashPassword('AdminPass#123'));
@@ -257,4 +257,30 @@ test('an unreadable key (server secret changed) never falls back to the shared k
   assert.deepEqual(used, []);
   a2.server.close(); a2.db.close();
   void b1;
+});
+
+test('an owner can update their own API key: it is checked with Google first, a bad key keeps the old one', async () => {
+  const c = await makeCustomer({ password: 'password123' });
+  const t = (await login(c.owner.email, 'password123')).data.token;
+  let info = await api('GET', '/api/my-ai-key', { token: t });
+  assert.equal(info.status, 200); assert.equal(info.data.own, false);
+  const good = 'AQ.Ab8RN6-new-owner-key-GOOD';
+  const ok = await api('POST', '/api/my-ai-key', { token: t, body: { key: good } });
+  assert.equal(ok.status, 200, JSON.stringify(ok.data));
+  info = await api('GET', '/api/my-ai-key', { token: t });
+  assert.equal(info.data.own, true); assert.equal(info.data.hint, '...GOOD');
+  assert.ok(!JSON.stringify(info.data).includes(good), 'the full key is never sent back');
+  // a key Google refuses is not saved
+  const bad = await api('POST', '/api/my-ai-key', { token: t, body: { key: 'AQ.Ab-broken-key-FAIL' } });
+  assert.equal(bad.status, 400); assert.match(bad.data.error, /old key is kept/);
+  assert.equal((await api('GET', '/api/my-ai-key', { token: t })).data.hint, '...GOOD');
+  // chat now runs on the owner's new key
+  used.length = 0;
+  await api('POST', '/api/chat', { token: t, body: { message: 'hello' } });
+  assert.deepEqual(used, [good]);
+  // empty or spaced keys, the admin account, and no login are refused
+  assert.equal((await api('POST', '/api/my-ai-key', { token: t, body: { key: '' } })).status, 400);
+  assert.equal((await api('POST', '/api/my-ai-key', { token: t, body: { key: 'two words' } })).status, 400);
+  assert.equal((await api('POST', '/api/my-ai-key', { token: ADMIN, body: { key: good } })).status, 403);
+  assert.equal((await api('POST', '/api/my-ai-key', { body: { key: good } })).status, 401);
 });

@@ -141,6 +141,35 @@ function openChangePassword() {
 }
 $('menu-password').onclick = openChangePassword;
 
+// The owner pastes their own new Gemini key. The server tries it with Google first and keeps the old key if it fails.
+async function openMyAiKey() {
+  let info = { own: false };
+  try { info = await api('GET', '/api/my-ai-key'); } catch { /* still show the form */ }
+  const key = h('input', { type: 'password', autocomplete: 'off', placeholder: 'Paste the key', spellcheck: 'false' });
+  const err = h('p', { class: 'error', role: 'alert', hidden: true });
+  const save = h('button', { class: 'yes', type: 'submit' }, 'Check and save key');
+  const form = h('form', { class: 'hb-form', id: 'mk-form' },
+    h('h2', { id: 'modal-title' }, 'Update API key'),
+    h('p', { class: 'sub' }, info.own ? `Your saved key ends with ${info.hint}. Paste a new key to replace it.` : 'Paste your Gemini API key. The AI chat and voice will use it.'),
+    h('label', {}, 'Gemini API key', key),
+    h('p', { class: 'sub' }, ['Make a key at ', h('a', { href: 'https://aistudio.google.com/apikey', target: '_blank', rel: 'noopener' }, 'aistudio.google.com/apikey'), '. It is checked with Google before saving, stored encrypted, and never shown again.']),
+    err);
+  form.onsubmit = async (e) => {
+    e.preventDefault(); err.hidden = true;
+    if (!key.value.trim()) { err.textContent = 'Paste the key first.'; err.hidden = false; return; }
+    save.disabled = true; save.textContent = 'Checking with Google...';
+    try {
+      await api('POST', '/api/my-ai-key', { key: key.value });
+      closeModal(); toast('API key updated. The AI now uses your new key.');
+      me = await api('GET', '/api/me'); $('mode-badge').hidden = me.ai;
+    } catch (ex) { err.textContent = ex.message; err.hidden = false; save.disabled = false; save.textContent = 'Check and save key'; }
+  };
+  save.setAttribute('form', 'mk-form');
+  showModal(form, [h('button', { type: 'button', onclick: closeModal }, 'Cancel'), save]);
+  key.focus();
+}
+$('menu-aikey').onclick = openMyAiKey;
+
 /* ---------- install as an app (PWA) ---------- */
 let installEvent = null;
 const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
@@ -832,7 +861,7 @@ function customerCard(o) {
       btn('Extend trial', () => openExtend(o), o.status === 'expired' ? 'go' : ''),
       o.status !== 'full' && btn('Renew (paid)', () => confirmAccess(o, 'make_full', `Mark ${o.name} as paid?`, 'They keep access with no end date.', 'Mark as paid')),
       o.locked ? btn('Unlock', () => doAccess(o, 'unlock', 'Unlocked.')) : btn('Lock now', () => confirmAccess(o, 'lock', `Lock ${o.name} now?`, 'They are stopped at once and see "contact the owner". Their data stays safe.', 'Lock now'), 'danger'),
-      btn('AI key', () => openAiKey(o)),
+      btn(o.ai === 'own' ? 'Update API key' : 'Add API key', () => openAiKey(o)),
       btn('Test AI', () => testAi(o)),
       btn('Reset password', () => openResetPassword(o)),
       btn('Download data', () => downloadData(o))));
@@ -919,13 +948,13 @@ function openExtend(o) {
 
 function openAiKey(o) {
   const key = h('input', { type: 'password', autocomplete: 'off', placeholder: 'Paste the key', spellcheck: 'false' });
-  const form = formModal('ai-form', `AI key for ${o.name}`, [
+  const form = formModal('ai-form', `${o.ai === 'own' ? 'Update' : 'Add'} API key for ${o.name}`, [
     h('p', { class: 'sub' }, o.ai === 'own' ? `A key is saved (${o.ai_hint}). Paste a new one to replace it.` : 'No key of their own yet. Paste the Gemini API key the owner sent you.'),
     h('label', {}, 'Gemini API key', key),
     h('p', { class: 'sub' }, ['The owner makes it at ', h('a', { href: AI_URL, target: '_blank', rel: 'noopener' }, 'aistudio.google.com/apikey'), '. It is stored encrypted and never shown again.'])],
   'Save key', async () => {
     if (!key.value.trim()) throw new Error('Paste the key first, or use Remove key.');
-    await api('POST', `/api/admin/owners/${o.id}/ai-key`, { key: key.value }); closeModal(); toast('AI key saved. Tap Test AI to check it.'); await renderAdmin();
+    await api('POST', `/api/admin/owners/${o.id}/ai-key`, { key: key.value }); closeModal(); toast('API key saved. Tap Test AI to check it.'); await renderAdmin();
   });
   if (o.ai === 'own') $('modal-actions').prepend(h('button', { type: 'button', class: 'no', onclick: async () => { closeModal(); await adminCall('POST', `/api/admin/owners/${o.id}/ai-key`, { key: '' }, 'Key removed.'); } }, 'Remove key'));
   key.focus();
@@ -974,7 +1003,7 @@ async function enterApp() {
   $('avatar').textContent = (me.name.trim()[0] || 'B').toUpperCase();
   const admin = me.role === 'admin';
   $('app').dataset.role = admin ? 'admin' : 'owner';
-  $('clear-chat').hidden = admin;
+  $('clear-chat').hidden = admin; $('menu-aikey').hidden = admin;
   $('auth').hidden = true; $('app').hidden = false;
   if (admin) { $('admin-view').hidden = false; $('menu-trial').hidden = true; await renderAdmin(); return; }
   $('admin-view').hidden = true;

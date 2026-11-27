@@ -24,7 +24,7 @@ export function createApp(overrides = {}) {
   const cfg = getConfig(overrides);
   const db = openDb(cfg.dbFile);
   const provider = overrides.provider !== undefined ? overrides.provider : cfg.geminiKey ? geminiProvider({ apiKey: cfg.geminiKey, model: cfg.geminiModel }) : null;
-  const authLimiter = makeLimiter(20, 10 * 60 * 1000);
+  const authLimiter = makeLimiter(overrides.loginsPerWindow || 20, 10 * 60 * 1000);
   const emailLimiter = makeLimiter(10, 15 * 60 * 1000); // per account, so many IPs together cannot guess one password
   const chatLimiter = makeLimiter(overrides.chatPerMinute || 40, 60 * 1000); // per owner: protects their Gemini key from being burned
   const DUMMY_HASH = hashPassword(crypto.randomBytes(16).toString('hex')); // makes "unknown email" take as long as "wrong password"
@@ -210,6 +210,28 @@ export function createApp(overrides = {}) {
     }
   }, { maxBody: 8_000_000 });
 
+  /* ---------------- the owner's own Gemini API key (the "Update API key" menu item) ---------------- */
+  const keyLimiter = makeLimiter(10, 10 * 60 * 1000);
+  route('GET', '/api/my-ai-key', ({ owner }) => {
+    const k = owner.gemini_key_enc ? openSecret(owner.gemini_key_enc, cfg.secret) : null;
+    return { own: Boolean(k), hint: k ? `...${k.slice(-4)}` : null, unreadable: Boolean(owner.gemini_key_enc && !k) };
+  });
+  // The new key is tried with Gemini first and saved only if it works, so an owner cannot break their own AI by mistake.
+  route('POST', '/api/my-ai-key', async ({ owner, body }) => {
+    if (!keyLimiter(`k${owner.id}`)) throw new HttpError(429, 'Too many tries. Wait 10 minutes and try again.');
+    const key = keyFrom(body.key);
+    if (!key) throw new HttpError(400, 'Please paste your new API key.');
+    try {
+      await makeProvider(key).generate({ system: 'Reply with the single word OK.', contents: [{ role: 'user', parts: [{ text: 'ping' }] }], tools: [] });
+    } catch (e) {
+      const why = e.status === 400 || e.status === 401 || e.status === 403 ? 'Google did not accept this key.' : e.status === 429 ? 'This key has used up its free limit for now.' : 'Could not reach Google to check the key.';
+      throw new HttpError(400, `${why} Your old key is kept. Check that you copied the whole key from Google AI Studio.`);
+    }
+    db.prepare('UPDATE owners SET gemini_key_enc = ? WHERE id = ?').run(seal(key, cfg.secret), owner.id);
+    providerCache.delete(owner.id);
+    db.prepare('INSERT INTO audit_log(owner_id, action, detail) VALUES(?,?,?)').run(owner.id, 'owner_set_ai_key', '{}');
+    return { ok: true, hint: `...${key.slice(-4)}` };
+  });
   route('POST', '/api/confirm', ({ ctx, body }) => {
     const token = String(body.token || '');
     const r = resolvePending(ctx, token, body.approve !== false);
