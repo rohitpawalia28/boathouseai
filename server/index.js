@@ -250,7 +250,9 @@ export function createApp(overrides = {}) {
   };
   const keyFrom = (k) => {
     const t = String(k ?? '').trim();
-    if (t && !/^[A-Za-z0-9_-]{20,120}$/.test(t)) throw new HttpError(400, 'That does not look like a Gemini API key. It is one long line of letters and numbers (it usually starts with AIza).');
+    // Any key format is fine (old ones start with AIza, newer ones with AQ. and so on). "Test AI" checks it for real.
+    // Only stop copy-paste mistakes: a key is one line with no spaces, and it is sent in an HTTP header.
+    if (t && (/[\s\x00-\x1f\x7f]/.test(t) || t.length > 500)) throw new HttpError(400, 'The key should be one line with no spaces. Copy it again from Google AI Studio.');
     return t;
   };
   const daysFrom = (v, fallback) => {

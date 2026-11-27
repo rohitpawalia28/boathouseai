@@ -891,7 +891,7 @@ function openAddCustomer() {
   const days = f('Free trial days', { type: 'number', min: '1', max: '365', value: '10', inputmode: 'numeric' });
   const paid = h('input', { type: 'checkbox' });
   paid.onchange = () => { days.input.disabled = paid.checked; };
-  const key = f('Their Gemini API key (optional now)', { type: 'password', placeholder: 'AIza...', autocomplete: 'off' });
+  const key = f('Their Gemini API key (optional now)', { type: 'password', placeholder: 'Paste the key', autocomplete: 'off' });
   const form = formModal('cu-form', 'Add customer', [
     name.row, email.row, phone.row, note.row, pass.row, days.row,
     h('label', { class: 'check' }, paid, ' Already paid (no trial)'),
@@ -918,7 +918,7 @@ function openExtend(o) {
 }
 
 function openAiKey(o) {
-  const key = h('input', { type: 'password', autocomplete: 'off', placeholder: 'AIza...', spellcheck: 'false' });
+  const key = h('input', { type: 'password', autocomplete: 'off', placeholder: 'Paste the key', spellcheck: 'false' });
   const form = formModal('ai-form', `AI key for ${o.name}`, [
     h('p', { class: 'sub' }, o.ai === 'own' ? `A key is saved (${o.ai_hint}). Paste a new one to replace it.` : 'No key of their own yet. Paste the Gemini API key the owner sent you.'),
     h('label', {}, 'Gemini API key', key),

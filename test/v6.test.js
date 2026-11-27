@@ -184,6 +184,11 @@ test('each customer uses their OWN Gemini key; the key is stored encrypted and n
   await api('POST', '/api/chat', { token: ta, body: { message: 'again' } });
   assert.deepEqual(used, ['SHARED']);
   assert.equal((await api('POST', `/api/admin/owners/${a.owner.id}/ai-key`, { token: ADMIN, body: { key: 'not a key!' } })).status, 400);
+  // newer Google keys do not start with AIza (for example "AQ.Ab..."): any one-line key is accepted
+  for (const k of ['AQ.Ab8RN6Lx-example_key.value', 'short1']) {
+    const ok = await api('POST', `/api/admin/owners/${a.owner.id}/ai-key`, { token: ADMIN, body: { key: k } });
+    assert.equal(ok.status, 200, k);
+  }
   assert.equal((await api('GET', '/api/me', { token: tb })).data.ai, true);
 });
 
