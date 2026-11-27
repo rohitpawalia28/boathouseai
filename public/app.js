@@ -54,6 +54,11 @@ const dot = (name) => colored(h('span', { class: 'dot' }), name);
 const gShow = (g) => (g == null ? '?' : g);
 const mShow = (m) => m ?? '?';
 const pShow = (p) => (p == null ? '?' : inr(p));
+// Shikara ride of one room: ✓ (with its one-time price), ✗, or ? while the owner has not said.
+const skState = (r) => (r.shikara == null ? 'pend' : r.shikara ? (r.shikara_price == null ? 'yes nop' : 'yes') : 'no');
+const skText = (r) => (r.shikara == null ? 'Shikara ?' : r.shikara ? `Shikara ✓ ${r.shikara_price == null ? '₹?' : inr(r.shikara_price)}` : 'Shikara ✗');
+const skTitle = (r) => (r.shikara == null ? 'Shikara ride: not told yet' : r.shikara ? `Shikara ride included${r.shikara_price == null ? ', price not told yet' : `, ${inr(r.shikara_price)} (once for this room)`}` : 'No shikara ride');
+const roomPending = (r) => r.guests == null || r.meal_plan == null || r.price == null || r.shikara == null || (r.shikara === true && r.shikara_price == null);
 const sumGuests = (rooms) => rooms.reduce((s, r) => s + (r.guests || 0), 0);
 /* ---------- shared popup helper ---------- */
 function showModal(bodyNodes, actionNodes) {
@@ -273,19 +278,21 @@ function bookingPreview(p) {
         b.is_own && h('span', { class: 'pill own' }, 'Your own'), b.is_new && h('span', { class: 'pill new' }, 'New name'),
         h('span', { class: 'grow' }), !b.is_own && h('span', { class: 'pay' }, `You pay ${inr(b.payable)}`)),
       h('table', { class: 'm-rooms' },
-        h('thead', {}, h('tr', {}, h('th', {}, 'Token'), h('th', { class: 'num' }, 'Guests'), h('th', {}, 'Meal'), h('th', { class: 'num' }, 'Per night'))),
-        h('tbody', {}, b.rooms.map((r) => h('tr', {}, h('td', { class: 'tokc' }, r.token), h('td', { class: 'num' + (r.guests == null ? ' pend' : '') }, gShow(r.guests)), h('td', { title: MEAL[r.meal_plan], class: r.meal_plan == null ? 'pend' : '' }, mShow(r.meal_plan)), h('td', { class: 'num' + (r.price == null ? ' pend' : '') }, pShow(r.price))))))));
+        h('thead', {}, h('tr', {}, h('th', {}, 'Room'), h('th', { class: 'num' }, 'Guests'), h('th', {}, 'Meal'), h('th', { class: 'num' }, 'Per night'), h('th', {}, 'Shikara'))),
+        h('tbody', {}, b.rooms.map((r) => h('tr', {}, h('td', { class: 'tokc' }, r.token), h('td', { class: 'num' + (r.guests == null ? ' pend' : '') }, gShow(r.guests)), h('td', { title: MEAL[r.meal_plan], class: r.meal_plan == null ? 'pend' : '' }, mShow(r.meal_plan)), h('td', { class: 'num' + (r.price == null ? ' pend' : '') }, pShow(r.price)), h('td', {}, h('span', { class: `sk ${skState(r)}`, title: skTitle(r) }, skText(r)))))))));
   }
   const t = p.totals;
   if (t.required) out.push(h('div', { class: 'm-note' }, `${t.required} rooms required · ${t.rooms} allocated now` + (t.left > 0 ? ` · ${t.left} left to allocate` : ' · all allocated')));
   if (t.pending_rooms?.length) out.push(h('div', { class: 'm-note warn' }, `Details pending (shown as ?) for ${t.pending_rooms.join(', ')}. Tell me later and I will fill them in. Pending prices count as ₹0 for now.`));
+  if (t.shikara_pending?.length) out.push(h('div', { class: 'm-note warn' }, `Shikara ride pending for ${t.shikara_pending.join(', ')}: is it included, and at what price per room?`));
   out.push(h('div', { class: 'm-totals' },
     h('div', { class: 'line' }, h('span', {}, `${plural(t.rooms, 'room')} · ${plural(t.guests, 'guest')}`), h('span', {}, `${p.nights} night${p.nights === 1 ? '' : 's'}`)),
+    t.shikara > 0 && h('div', { class: 'line' }, h('span', {}, 'Shikara rides (once per room)'), h('span', {}, inr(t.shikara))),
     h('div', { class: 'line big' }, h('span', {}, 'Client total'), h('span', {}, inr(t.client_total))),
     t.advance > 0 && h('div', { class: 'line' }, h('span', {}, 'Advance received'), h('span', {}, inr(t.advance))),
     t.advance > 0 && h('div', { class: 'line' }, h('span', {}, 'Client still to pay'), h('span', {}, inr(t.client_due))),
     t.payable > 0 && h('div', { class: 'line' }, h('span', {}, 'You will owe houseboats'), h('span', {}, inr(t.payable)))));
-  out.push(h('div', { class: 'm-ask' }, 'Any change in pricing, guests or meal plan? Tell me in the chat, or confirm to save.'));
+  out.push(h('div', { class: 'm-ask' }, 'Any change in pricing, guests, meal plan or shikara ride? Tell me in the chat, or confirm to save.'));
   return out;
 }
 
@@ -585,7 +592,19 @@ function roomGroups(b) {
   for (const r of b.rooms) { if (!groups.has(r.houseboat)) groups.set(r.houseboat, { own: !!r.is_own, rooms: [] }); groups.get(r.houseboat).rooms.push(r); }
   return [...groups].sort((x, y) => Number(y[1].own) - Number(x[1].own)).map(([name, g]) => h('div', { class: 'boat-group' },
     h('div', { class: 'boat-name' }, dot(name), name, g.own && h('span', { class: 'pill own' }, 'own'), h('span', { class: 'count' }, `${plural(g.rooms.length, 'room')} · ${plural(sumGuests(g.rooms), 'guest')}`)),
-    h('div', { class: 'tok-list' }, g.rooms.map((r) => colored(h('button', { class: 'tok' + (r.guests == null || r.meal_plan == null || r.price == null ? ' pending' : ''), type: 'button', title: `${r.guests == null ? 'guests pending' : plural(r.guests, 'guest')} · ${MEAL[r.meal_plan] || 'meal plan pending'} · ${r.price == null ? 'price pending' : inr(r.price) + '/night'}`, onclick: () => asTokenChat(r.token) }, r.token, h('small', {}, `${gShow(r.guests)}g · ${mShow(r.meal_plan)}`)), name)))));
+    h('div', { class: 'room-grid' }, g.rooms.map(roomTile(name)))));
+}
+
+// One room = one tile: token and price on top, guests and meal plan, then the shikara ride. Anything not told yet shows "?".
+function roomTile(boat) {
+  const q = (v, text, what) => (v == null ? h('span', { class: 'q-wrap' }, h('b', { class: 'q', title: 'Not told yet' }, '?'), what ? ` ${what}` : '') : text);
+  return (r) => colored(h('button', { class: 'room' + (roomPending(r) ? ' pending' : ''), type: 'button', title: `Ask about ${r.token}`, onclick: () => asTokenChat(r.token) },
+    h('span', { class: 'room-top' }, h('span', { class: 'room-tok' }, r.token), h('span', { class: 'room-price' }, r.price == null ? q(null, null, '/night') : [inr(r.price), h('small', {}, '/night')])),
+    h('span', { class: 'room-info' },
+      h('span', {}, q(r.guests, plural(r.guests, 'guest'), 'guests')),
+      h('span', { class: 'sep' }, '·'),
+      h('span', { title: MEAL[r.meal_plan] || 'Meal plan not told yet' }, q(r.meal_plan, r.meal_plan, 'meal'))),
+    h('span', { class: `sk ${skState(r)}`, title: skTitle(r) }, skText(r))), boat);
 }
 
 async function askDelete(kind, id) {
@@ -614,7 +633,7 @@ async function renderOverview(body) {
     kpi('Rooms tonight', d.rooms_tonight), kpi('Arrivals today', d.arrivals_today), kpi('Departures today', d.departures_today),
     kpi('Clients owe you', inr(d.to_receive), d.to_receive > 0 ? 'neg' : '', true), kpi('You owe houseboats', inr(d.to_pay), d.to_pay > 0 ? 'neg' : '', true), kpi('Upcoming bookings', d.upcoming_bookings),
     d.details_pending > 0 && kpi('Details pending', d.details_pending, 'warn'), d.rooms_left_to_allocate > 0 && kpi('Rooms to allocate', d.rooms_left_to_allocate, 'warn')));
-  if (d.details_pending > 0) body.append(h('button', { class: 'alert-btn', type: 'button', onclick: () => { tab = 'bookings'; pendingOnly = true; renderTabs(); refreshPanel(); } }, `${plural(d.details_pending, 'booking')} with guests, price or meal plan still to fill in – tap to see`));
+  if (d.details_pending > 0) body.append(h('button', { class: 'alert-btn', type: 'button', onclick: () => { tab = 'bookings'; pendingOnly = true; renderTabs(); refreshPanel(); } }, `${plural(d.details_pending, 'booking')} with guests, price, meal plan or shikara ride still to fill in – tap to see`));
   body.append(h('div', { class: 'sec-title' }, 'Coming up'));
   const up = bookings.filter((b) => b.check_out > d.today).sort((a, b) => a.check_in.localeCompare(b.check_in)).slice(0, 6);
   if (!up.length) body.append(empty('No upcoming bookings yet. Tell the chat: "2 Dec, 8 rooms, 4 mine, 2 Chinar, 2 Cultural Palace".'));
@@ -793,6 +812,7 @@ async function renderReports(body) {
   const t = r.totals;
   body.append(h('div', { class: 'kpis' }, kpi('Client billing', inr(t.revenue), 'pos'), kpi('Payable to houseboats', inr(t.payable)), kpi('Your margin', inr(t.margin), t.margin >= 0 ? 'pos' : 'neg')));
   body.append(h('div', { class: 'sub' }, `${plural(t.bookings, 'booking')} · ${plural(t.room_nights, 'room-night')}. Each room counts for the nights it stays inside this month.${r.pending_price_rooms ? ` ${plural(r.pending_price_rooms, 'room')} without a price count as ₹0.` : ''}`));
+  if (r.shikara?.rides) body.append(h('div', { class: 'sub' }, `Shikara rides for guests arriving this month: ${r.shikara.rides}, ${inr(r.shikara.amount)} (charged once per room, on top of the room billing).`));
   if (!r.by_houseboat.length) return body.append(empty('No bookings in this month.'));
   body.append(h('div', { class: 'sec-title' }, 'By houseboat'));
   for (const x of r.by_houseboat) body.append(h('div', { class: 'card' }, h('div', { class: 'row' }, h('span', { class: 'name' }, dot(x.houseboat), x.houseboat, x.own && h('span', { class: 'pill own' }, 'own')), h('strong', {}, inr(x.revenue))),

@@ -41,7 +41,8 @@ async function ask(tool, args) {
   const ctx = { store: app.store, ownerId: 1, ownerName: 'Carol', tz: 'Asia/Kolkata' };
   return TOOL_MAP.get(tool).format(await runReadTool(ctx, tool, args));
 }
-const room = (houseboat, guests, price, meal_plan, extra = {}) => ({ houseboat, guests, price, meal_plan, ...extra });
+// shikara: false = "no shikara ride" (so only the details a test skips on purpose show as pending)
+const room = (houseboat, guests, price, meal_plan, extra = {}) => ({ houseboat, guests, price, meal_plan, shikara: false, ...extra });
 const bookings = async () => (await api('GET', '/api/bookings')).data;
 
 test('sender is compulsory: missing or "Not Provided" never reaches a card; "Direct" is fine', async () => {
@@ -91,7 +92,7 @@ test('optional details: skip guests / price / meal plan -> "details pending", th
   assert.ok((await api('GET', '/api/dashboard')).data.details_pending >= 1);
   assert.equal((await api('GET', '/api/bookings?pending=1')).data.length, 1);
   // fill in CHI002: guests, plan, price -> client total grows by price x nights
-  const u = await ok('update_room', { booking_id: b.id, token: 'CHI002', guests: 3, meal_plan: 'CPI', price: 4500 });
+  const u = await ok('update_room', { booking_id: b.id, token: 'CHI002', guests: 3, meal_plan: 'CPI', price: 4500, shikara: false });
   assert.match(u.done.message, /3 guests, CP, ₹4,500/);
   const b2 = (await bookings()).find((x) => x.id === b.id);
   assert.equal(b2.billed, 8000 + 4500 * 2);
@@ -514,4 +515,58 @@ test('add_houseboats: the AI adds many houseboats in one confirmation (own + par
   assert.ok(!bad.data.pending);
   assert.ok(!(await boatsNow())['Huge Boat']);
   ai.queue.length = 0;
+});
+
+test('shikara ride per room: pending (?) until told, yes with a price (charged once), no; bulk set; remove and cancel take it back', async () => {
+  const mk = await propose('create_booking', {
+    client_name: 'Shikara Family', sender: 'Direct', check_in: D(300), check_out: D(303),
+    rooms: [
+      { houseboat: 'Lake View', guests: 2, price: 4000, meal_plan: 'CP', shikara: true, shikara_price: 800 },
+      { houseboat: 'Lake View', guests: 2, price: 4000, meal_plan: 'CP', shikara: false },
+      { houseboat: 'Lake View', guests: 2, price: 4000, meal_plan: 'CP' },
+      { houseboat: 'Lake View', guests: 2, price: 4000, meal_plan: 'CP', shikara: 'yes' },
+    ],
+  });
+  const p = mk.pending.preview;
+  const rs = p.houseboats[0].rooms;
+  assert.deepEqual(rs.map((r) => [r.shikara, r.shikara_price]), [[true, 800], [false, null], [null, null], [true, null]]);
+  assert.deepEqual(p.totals.shikara_pending, ['LAK003', 'LAK004'], 'not told, and included without a price, are pending');
+  assert.equal(p.totals.shikara, 800);
+  assert.equal(p.totals.client_total, 4 * 4000 * 3 + 800, 'the shikara ride is charged once per room, not per night');
+  assert.match(mk.pending.summary, /LAK001.*shikara ✓ ₹800/);
+  assert.match(mk.pending.summary, /LAK002.*shikara ✗/);
+  assert.match(mk.pending.summary, /LAK003.*shikara pending/);
+  await confirm(mk.pending.token);
+  let b = (await bookings()).find((x) => x.client_name === 'Shikara Family');
+  assert.equal(b.billed, 48800);
+  assert.deepEqual(b.pending_tokens, ['LAK003', 'LAK004']);
+  assert.deepEqual(b.rooms.map((r) => r.shikara), [true, false, null, true]);
+  // the owner gives the price for LAK004 and says LAK003 also has one, all at 600
+  const bulk = await propose('set_shikara', { booking_id: b.id, included: true, price: 600, tokens: 'lak003, LAK004' });
+  assert.match(bulk.pending.preview.lines.join(' '), /LAK003, LAK004: shikara ride included, ₹600 per room/);
+  assert.match(bulk.pending.preview.lines.join(' '), /Client total \+₹1,200/);
+  assert.equal((await confirm(bulk.pending.token)).data.status, 'confirmed');
+  b = (await bookings()).find((x) => x.id === b.id);
+  assert.equal(b.billed, 48800 + 1200);
+  assert.deepEqual(b.pending_tokens, []);
+  // one room changes its mind: no shikara -> the 800 goes back
+  const one = await ok('update_room', { booking_id: b.id, token: 'LAK001', shikara: false });
+  assert.match(one.done.message, /shikara ✗/);
+  b = (await bookings()).find((x) => x.id === b.id);
+  assert.equal(b.billed, 48800 + 1200 - 800);
+  // removing a room takes back its nights and its shikara ride
+  await ok('remove_room', { booking_id: b.id, token: 'LAK004' });
+  b = (await bookings()).find((x) => x.id === b.id);
+  assert.equal(b.billed, 48800 + 1200 - 800 - (4000 * 3 + 600));
+  // changing the dates changes the nights only, never the shikara rides
+  await ok('update_booking', { booking_id: b.id, check_out: D(304) });
+  b = (await bookings()).find((x) => x.id === b.id);
+  assert.equal(b.billed, 3 * 4000 * 4 + 600);
+  // a bad price is refused
+  ai.queue.push(call('set_shikara', { booking_id: b.id, included: true, price: -5 }), say('Price cannot be negative.'));
+  assert.equal((await api('POST', '/api/chat', { body: { message: 'shikara -5' } })).data.pending, null);
+  ai.queue.length = 0;
+  // cancelling reverses everything, shikara included
+  await ok('cancel_booking', { booking_id: b.id });
+  assert.equal((await bookings()).find((x) => x.id === b.id).balance, 0);
 });

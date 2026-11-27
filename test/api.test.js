@@ -52,7 +52,8 @@ async function propose(token, toolName, args, message = 'do it') {
 }
 const confirm = (token, t, approve = true) => api('POST', '/api/confirm', { token, body: { token: t, approve } });
 
-const room = (houseboat, guests, price, meal_plan, extra = {}) => ({ houseboat, guests, price, meal_plan, ...extra });
+// shikara: false = "no shikara ride" (so only the details a test skips on purpose show as pending)
+const room = (houseboat, guests, price, meal_plan, extra = {}) => ({ houseboat, guests, price, meal_plan, shikara: false, ...extra });
 // The 8-room example from the owner: 4 own, 2 Chinar, 2 Cultural Palace.
 const eightRooms = (extra = {}) => ({
   sender: 'Direct', client_name: 'Sharma Family', phone: '9876500001', check_in: D(10), check_out: D(12), ...extra,

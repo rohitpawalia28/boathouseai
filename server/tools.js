@@ -155,7 +155,11 @@ async function getBooking(ctx, id) {
 
 const nightsOf = (b) => nightsBetween(b.check_in, b.check_out).length;
 
-export const isPending = (r) => r.guests == null || r.meal_plan == null || r.price == null;
+// A room is "details pending" until guests, meal plan, price AND the shikara ride (yes/no, and its price when yes) are known.
+export const shikaraPending = (r) => r.shikara == null || (r.shikara === true && r.shikara_price == null);
+export const isPending = (r) => r.guests == null || r.meal_plan == null || r.price == null || shikaraPending(r);
+// The shikara ride is charged once per room (not per night).
+const shikaraAmount = (r) => (r.shikara === true ? r.shikara_price || 0 : 0);
 
 // Bookings with their rooms (houseboat name, own flag), client money and what is due to each houseboat.
 export async function bookingRows(ctx, f = {}) {
@@ -193,7 +197,7 @@ export async function bookingRows(ctx, f = {}) {
   return bookings.map((b) => {
     const rooms = roomsOf.get(b.id)
       .filter((r) => boat.has(r.houseboat_id))
-      .map((r) => { const h = boat.get(r.houseboat_id); return { token: r.token, houseboat: h.name, is_own: h.is_own, guests: r.guests ?? null, meal_plan: r.meal_plan ?? null, price: r.price ?? null, cost: r.cost, _room_no: r.room_no }; })
+      .map((r) => { const h = boat.get(r.houseboat_id); return { token: r.token, houseboat: h.name, is_own: h.is_own, guests: r.guests ?? null, meal_plan: r.meal_plan ?? null, price: r.price ?? null, cost: r.cost, shikara: r.shikara ?? null, shikara_price: r.shikara_price ?? null, _room_no: r.room_no }; })
       .sort((x, y) => (x.houseboat < y.houseboat ? -1 : x.houseboat > y.houseboat ? 1 : x._room_no - y._room_no))
       .map(({ _room_no, ...r }) => r);
     const entries = ledgerOf.get(b.id) || [];
@@ -326,7 +330,7 @@ export function validateArgs(schema, raw, path = '') {
     const label = path + key;
     if (v === undefined || v === null || v === '') continue;
     // "skip" / "unspecified" / "unknown" for an optional detail simply means: leave it out for now.
-    if (typeof v === 'string' && def.type !== 'boolean' && def.type !== 'array' && SKIP_WORDS.has(v.trim().toLowerCase())) continue;
+    if (typeof v === 'string' && def.type !== 'array' && SKIP_WORDS.has(v.trim().toLowerCase())) continue;
     if (def.type === 'integer' || def.type === 'number') {
       const n = Number(String(v).replace(/,/g, ''));
       if (!Number.isFinite(n)) throw new ToolError(`"${label}" must be a number.`);
@@ -367,7 +371,8 @@ const lines = (...parts) => parts.flat().filter(Boolean).join('\n');
 const gTxt = (g) => (g == null ? 'guests pending' : `${g} guest${g > 1 ? 's' : ''}`);
 const mTxt = (m) => m ?? 'meal plan pending';
 const pTxt = (p) => (p == null ? 'price pending' : `${inr(p)}/night`);
-const roomLine = (r) => `${r.token} · ${r.houseboat} · ${gTxt(r.guests)} · ${mTxt(r.meal_plan)} · ${pTxt(r.price)}`;
+const sTxt = (r) => (r.shikara == null ? 'shikara pending' : r.shikara ? `shikara ✓ ${r.shikara_price == null ? '(price pending)' : inr(r.shikara_price)}` : 'shikara ✗');
+const roomLine = (r) => `${r.token} · ${r.houseboat} · ${gTxt(r.guests)} · ${mTxt(r.meal_plan)} · ${pTxt(r.price)} · ${sTxt(r)}`;
 const sum = (arr, f) => arr.reduce((s, x) => s + (f(x) || 0), 0);
 const MEAL = (what = 'Meal plan') => S(`${what}: EP = room only, CP = + breakfast, MAP (also said MAPI) = + breakfast and dinner, AP = all meals`, { enum: MEAL_PLANS, aliases: MEAL_ALIASES });
 
@@ -404,9 +409,20 @@ const ROOM_ITEM = {
     meal_plan: MEAL('Meal plan for this room. Leave out if the owner says skip / not decided yet.'),
     partner_price: I('What the houseboat charges the owner per night for this room, if different from the client price (optional)'),
     room_no: I('A specific room number if the owner names one (optional; otherwise assigned automatically)'),
+    shikara: { type: 'boolean', description: 'Is a shikara ride included for this room? true = included, false = not included. Leave out if the owner did not say (it then shows as pending).' },
+    shikara_price: I('Price of the shikara ride for this room in rupees, charged ONCE per room (not per night). Only when shikara is true; leave out if the owner did not say the price yet.'),
   },
   required: ['houseboat'],
 };
+
+// shikara + shikara_price from the owner's words: a price alone means "included"; "not included" drops any price.
+function cleanShikara(r) {
+  let shikara = r.shikara === undefined ? null : r.shikara === true;
+  let price = r.shikara_price === undefined ? null : r.shikara_price;
+  if (price != null) { if (!(price >= 0) || price > 100000) throw new ToolError('Shikara ride price must be between 0 and 1,00,000.'); if (shikara === null) shikara = true; }
+  if (shikara === false) price = null;
+  return { shikara, shikara_price: price };
+}
 
 // One room of a booking (by token, any letter case) with its houseboat name and own flag.
 async function roomWithBoat(ctx, bookingId, token) {
@@ -468,7 +484,7 @@ async function planRooms(ctx, rawRooms, checkIn, checkOut) {
     if (r.partner_price !== undefined && !(r.partner_price >= 0)) throw new ToolError('Houseboat price cannot be negative.');
     const b = boats.get(r.key);
     const cost = b.is_own ? 0 : (r.partner_price ?? r.price ?? 0);
-    return { key: r.key, houseboat: b.name, token: `${b.prefix}${pad3(r.no)}`, room_no: r.no, guests: r.guests ?? null, meal_plan: r.meal_plan ?? null, price: r.price ?? null, cost, own: b.is_own };
+    return { key: r.key, houseboat: b.name, token: `${b.prefix}${pad3(r.no)}`, room_no: r.no, guests: r.guests ?? null, meal_plan: r.meal_plan ?? null, price: r.price ?? null, cost, own: b.is_own, ...cleanShikara(r) };
   });
   const tokens = rooms.map((r) => r.token);
   if (new Set(tokens).size !== tokens.length) throw new ToolError('Two rooms got the same room number on one houseboat. Give different room numbers.');
@@ -501,17 +517,22 @@ async function saveRooms(ctx, bookingId, rooms, nights) {
     const hb = boats.get(r.houseboat.toLowerCase());
     const token = `${hb.prefix}${pad3(r.room_no)}`;
     const cost = hb.is_own ? 0 : (r.cost ?? 0);
-    await col(ctx, 'booking_rooms').insert({ booking_id: bookingId, owner_id: ctx.ownerId, houseboat_id: hb.id, room_no: r.room_no, token, guests: r.guests ?? null, meal_plan: r.meal_plan ?? null, price: r.price ?? null, cost });
+    const sk = cleanShikara(r);
+    await col(ctx, 'booking_rooms').insert({ booking_id: bookingId, owner_id: ctx.ownerId, houseboat_id: hb.id, room_no: r.room_no, token, guests: r.guests ?? null, meal_plan: r.meal_plan ?? null, price: r.price ?? null, cost, ...sk });
     for (const d of nights) await lockNight(ctx, hb.id, r.room_no, d, bookingId, token);
-    saved.push({ token, houseboat: hb.name, own: !!hb.is_own, guests: r.guests ?? null, meal_plan: r.meal_plan ?? null, price: r.price ?? null, cost, houseboat_id: hb.id });
+    saved.push({ token, houseboat: hb.name, own: !!hb.is_own, guests: r.guests ?? null, meal_plan: r.meal_plan ?? null, price: r.price ?? null, cost, houseboat_id: hb.id, ...sk });
   }
   return saved;
 }
 
 // Adds the client charge and the per-houseboat charges for rooms over some nights.
-async function chargeRooms(ctx, bookingId, rooms, nightCount, note) {
-  const clientAmount = sum(rooms, (r) => r.price) * nightCount;
-  if (clientAmount) await addLedger(ctx, { booking: bookingId, side: 'CLIENT', type: 'CHARGE', amount: clientAmount, note });
+// withShikara: new rooms also get their one-time shikara charge (not when only the number of nights changes).
+async function chargeRooms(ctx, bookingId, rooms, nightCount, note, { withShikara = false } = {}) {
+  const roomAmount = sum(rooms, (r) => r.price) * nightCount;
+  if (roomAmount) await addLedger(ctx, { booking: bookingId, side: 'CLIENT', type: 'CHARGE', amount: roomAmount, note });
+  const shikara = withShikara ? sum(rooms, shikaraAmount) : 0;
+  if (shikara) await addLedger(ctx, { booking: bookingId, side: 'CLIENT', type: 'CHARGE', amount: shikara, note: `Shikara rides: ${rooms.filter((r) => shikaraAmount(r)).map((r) => r.token).join(', ')}` });
+  const clientAmount = roomAmount + shikara;
   const per = new Map();
   for (const r of rooms) if (r.cost) per.set(r.houseboat_id, (per.get(r.houseboat_id) || 0) + r.cost * nightCount);
   const payables = [];
@@ -532,7 +553,7 @@ async function stayingRooms(ctx, from, to, { houseboatId = null, mealPlan = null
   const boats = new Map((await allHouseboats(ctx)).map((h) => [h.id, h]));
   return (await col(ctx, 'booking_rooms').find(q)).filter((r) => boats.has(r.houseboat_id)).map((r) => {
     const b = bk.get(r.booking_id); const h = boats.get(r.houseboat_id);
-    return { token: r.token, guests: r.guests ?? null, meal_plan: r.meal_plan ?? null, price: r.price ?? null, cost: r.cost, hid: h.id, houseboat: h.name, is_own: h.is_own, booking_id: b.id, client_name: b.client_name, sender: b.sender ?? null, check_in: b.check_in, check_out: b.check_out };
+    return { token: r.token, guests: r.guests ?? null, meal_plan: r.meal_plan ?? null, price: r.price ?? null, cost: r.cost, shikara: r.shikara ?? null, shikara_price: r.shikara_price ?? null, hid: h.id, houseboat: h.name, is_own: h.is_own, booking_id: b.id, client_name: b.client_name, sender: b.sender ?? null, check_in: b.check_in, check_out: b.check_out };
   });
 }
 
@@ -614,6 +635,7 @@ export async function reportData(ctx, a) {
     totals: { room_nights: sum(byBoat, (x) => x.room_nights), revenue: sum(byBoat, (x) => x.revenue), payable: sum(byBoat, (x) => x.payable), margin: sum(byBoat, (x) => x.margin), bookings: new Set(rows.map((r) => r.booking_id)).size },
     by_houseboat: byBoat, by_sender: bySender,
     pending_price_rooms: rows.filter((r) => r.price == null).length,
+    shikara: { rides: rows.filter((r) => r.shikara === true && r.check_in >= from && r.check_in <= to).length, amount: sum(rows.filter((r) => r.check_in >= from && r.check_in <= to), shikaraAmount) },
   };
 }
 
@@ -694,7 +716,7 @@ export const TOOLS = [
         booking_id: b.id, client: b.client_name, sender: b.sender || null, phone: b.phone, check_in: b.check_in, check_out: b.check_out, nights: b.nights, status: b.status,
         rooms_required: b.rooms_required, rooms_allocated: b.rooms_allocated, rooms_left_to_allocate: b.rooms_left,
         details_pending_tokens: b.pending_tokens,
-        rooms: b.rooms.map((r) => ({ token: r.token, houseboat: r.houseboat, own: !!r.is_own, guests: r.guests, meal_plan: r.meal_plan, price_per_night: r.price, pay_houseboat_per_night: r.cost })),
+        rooms: b.rooms.map((r) => ({ token: r.token, houseboat: r.houseboat, own: !!r.is_own, guests: r.guests, meal_plan: r.meal_plan, price_per_night: r.price, pay_houseboat_per_night: r.cost, shikara_included: r.shikara, shikara_price: r.shikara_price })),
         total_guests: sum(b.rooms, (r) => r.guests),
         client_total: b.billed, client_paid: b.received, client_due: b.balance,
         houseboat_dues: b.houseboat_dues.map((d) => ({ houseboat: d.houseboat, to_pay: d.payable, paid: d.paid, pending: d.pending })),
@@ -705,7 +727,7 @@ export const TOOLS = [
         ? r.map((b) => lines(
             `#${b.booking_id} ${b.client}${b.sender ? ` (sender: ${b.sender})` : ''} - ${prettyDate(b.check_in)} to ${prettyDate(b.check_out)} (${b.nights} night${b.nights > 1 ? 's' : ''}) [${b.status}]`,
             b.rooms_required ? `Rooms: ${b.rooms_required} required, ${b.rooms_allocated} allocated${b.rooms_left_to_allocate ? `, ${b.rooms_left_to_allocate} left to allocate` : ''}` : '',
-            b.rooms.map((x) => `- ${roomLine({ ...x, guests: x.guests, price: x.price_per_night })}`),
+            b.rooms.map((x) => `- ${roomLine({ ...x, guests: x.guests, price: x.price_per_night, shikara: x.shikara_included })}`),
             b.details_pending_tokens.length ? `Details pending for: ${b.details_pending_tokens.join(', ')}` : '',
             `Client total ${inr(b.client_total)}, paid ${inr(b.client_paid)}, due ${inr(b.client_due)}`
           )).join('\n\n')
@@ -770,6 +792,7 @@ export const TOOLS = [
         `Client billing ${inr(r.totals.revenue)}, payable to houseboats ${inr(r.totals.payable)}, your margin ${inr(r.totals.margin)}.`,
         r.by_houseboat.map((x) => `- ${x.houseboat}${x.own ? ' (own)' : ''}: ${x.room_nights} room-nights, billing ${inr(x.revenue)}${x.own ? '' : `, payable ${inr(x.payable)}`}`),
         r.by_sender.length > 1 ? ['By sender:', r.by_sender.map((x) => `- ${x.sender}: ${x.bookings} booking${x.bookings === 1 ? '' : 's'}, ${inr(x.revenue)}`)] : '',
+        r.shikara?.rides ? `Shikara rides: ${r.shikara.rides}, ${inr(r.shikara.amount)} (not inside the room billing above).` : '',
         r.pending_price_rooms ? `Note: ${r.pending_price_rooms} room(s) have no price yet and count as ₹0.` : ''
       ),
   },
@@ -869,7 +892,8 @@ export const TOOLS = [
         if (a.rooms_required < rooms.length) throw new ToolError(`You gave ${rooms.length} rooms but the client needs only ${a.rooms_required}. Please check the numbers.`);
         if (a.rooms_required > 500) throw new ToolError('Rooms required looks too high.');
       }
-      const clientTotal = sum(rooms, (r) => r.price) * nights.length;
+      const shikaraTotal = sum(rooms, shikaraAmount);
+      const clientTotal = sum(rooms, (r) => r.price) * nights.length + shikaraTotal;
       const advance = a.advance_paid || 0;
       const pendingRooms = rooms.filter(isPending);
       if (advance < 0) throw new ToolError('Advance cannot be negative.');
@@ -881,22 +905,23 @@ export const TOOLS = [
         client: a.client_name, sender, phone: a.phone || null, check_in: a.check_in, check_out: a.check_out, nights: nights.length, notes: a.notes || null,
         houseboats: [...boats.values()].map((b) => {
           const rs = rooms.filter((r) => r.key === b.key);
-          return { name: b.name, prefix: b.prefix, is_own: b.is_own, is_new: b.is_new, payable: sum(rs, (r) => r.cost) * nights.length, rooms: rs.map((r) => ({ token: r.token, guests: r.guests, meal_plan: r.meal_plan, price: r.price, cost: r.cost })) };
+          return { name: b.name, prefix: b.prefix, is_own: b.is_own, is_new: b.is_new, payable: sum(rs, (r) => r.cost) * nights.length, rooms: rs.map((r) => ({ token: r.token, guests: r.guests, meal_plan: r.meal_plan, price: r.price, cost: r.cost, shikara: r.shikara, shikara_price: r.shikara_price })) };
         }),
         totals: {
           rooms: rooms.length, guests: sum(rooms, (r) => r.guests), client_total: clientTotal, advance, client_due: clientTotal - advance, payable: sum(rooms, (r) => r.cost) * nights.length,
-          required: a.rooms_required || null, left, pending_rooms: pendingRooms.map((r) => r.token),
+          required: a.rooms_required || null, left, pending_rooms: pendingRooms.map((r) => r.token), shikara: shikaraTotal,
+          shikara_pending: rooms.filter(shikaraPending).map((r) => r.token),
         },
       };
       const summary = lines(
         `Book ${a.client_name} (sender: ${sender})${a.phone ? ` (${a.phone})` : ''}: ${prettyDate(a.check_in)} to ${prettyDate(a.check_out)} (${nights.length} night${nights.length > 1 ? 's' : ''})`,
         a.rooms_required ? `${a.rooms_required} rooms required, ${rooms.length} allocated now, ${left} left to allocate` : '',
         rooms.map((r) => roomLine(r)),
-        `Client total ${inr(clientTotal)}${advance ? `, advance ${inr(advance)}, due ${inr(clientTotal - advance)}` : ''}`,
+        `Client total ${inr(clientTotal)}${shikaraTotal ? ` (includes shikara rides ${inr(shikaraTotal)})` : ''}${advance ? `, advance ${inr(advance)}, due ${inr(clientTotal - advance)}` : ''}`,
         pendingRooms.length ? `Details pending for: ${pendingRooms.map((r) => r.token).join(', ')}` : ''
       );
       return {
-        args: { client_name: a.client_name, sender, phone: a.phone || null, check_in: a.check_in, check_out: a.check_out, notes: a.notes || null, advance, rooms_required: a.rooms_required || null, rooms: rooms.map((r) => ({ houseboat: r.houseboat, own: r.own, room_no: r.room_no, guests: r.guests, meal_plan: r.meal_plan, price: r.price, cost: r.cost })) },
+        args: { client_name: a.client_name, sender, phone: a.phone || null, check_in: a.check_in, check_out: a.check_out, notes: a.notes || null, advance, rooms_required: a.rooms_required || null, rooms: rooms.map((r) => ({ houseboat: r.houseboat, own: r.own, room_no: r.room_no, guests: r.guests, meal_plan: r.meal_plan, price: r.price, cost: r.cost, shikara: r.shikara ?? undefined, shikara_price: r.shikara_price ?? undefined })) },
         summary, preview,
       };
     },
@@ -905,7 +930,7 @@ export const TOOLS = [
       const nights = nightsBetween(a.check_in, a.check_out);
       const bookingId = (await col(ctx, 'bookings').insert({ owner_id: ctx.ownerId, client_name: a.client_name, sender, phone: a.phone ?? null, check_in: a.check_in, check_out: a.check_out, notes: a.notes ?? null, rooms_required: a.rooms_required ?? null, status: 'confirmed', cancelled_at: null })).id;
       const saved = await saveRooms(ctx, bookingId, a.rooms, nights);
-      const { clientAmount, payables } = await chargeRooms(ctx, bookingId, saved, nights.length, `Booking #${bookingId}`);
+      const { clientAmount, payables } = await chargeRooms(ctx, bookingId, saved, nights.length, `Booking #${bookingId}`, { withShikara: true });
       if (a.advance) await addLedger(ctx, { booking: bookingId, side: 'CLIENT', type: 'PAYMENT', amount: -a.advance, method: 'advance', note: `Advance for booking #${bookingId}` });
       const nameOf = new Map(saved.map((r) => [r.houseboat_id, r.houseboat]));
       return {
@@ -938,6 +963,8 @@ export const TOOLS = [
         meal_plan: MEAL('New meal plan'),
         price: I('New price per night charged to the client'),
         partner_price: I('New price per night the houseboat charges you'),
+        shikara: { type: 'boolean', description: 'Shikara ride for this room: true = included, false = not included' },
+        shikara_price: I('Price of this room\'s shikara ride in rupees, once per room (not per night)'),
       },
       required: ['booking_id', 'token'],
     },
@@ -955,7 +982,12 @@ export const TOOLS = [
         if (r.is_own) throw new ToolError(`${r.houseboat} is your own houseboat, so there is nothing to pay it.`);
         ch.push(`houseboat price ${inr(r.cost)} -> ${inr(a.partner_price)}/night`);
       }
-      if (!ch.length) throw new ToolError('Nothing to change. Tell me the new guests, meal plan or price.');
+      if (a.shikara !== undefined || a.shikara_price !== undefined) {
+        const next = cleanShikara({ shikara: a.shikara ?? (a.shikara_price !== undefined ? true : r.shikara ?? undefined), shikara_price: a.shikara_price ?? (a.shikara === false ? undefined : r.shikara_price ?? undefined) });
+        const d = shikaraAmount(next) - shikaraAmount({ shikara: r.shikara ?? null, shikara_price: r.shikara_price ?? null });
+        ch.push(`shikara ride ${sTxt({ shikara: r.shikara ?? null, shikara_price: r.shikara_price ?? null }).replace('shikara ', '')} -> ${sTxt(next).replace('shikara ', '')}${d ? ` (client total ${d > 0 ? '+' : '-'}${inr(Math.abs(d))})` : ''}`);
+      }
+      if (!ch.length) throw new ToolError('Nothing to change. Tell me the new guests, meal plan, price or shikara ride.');
       return { args: { ...a, booking_id: b.id, token: r.token }, summary: `Update ${r.token} (${r.houseboat}) in booking #${b.id} - ${b.client_name}: ${ch.join('; ')}`, preview: { kind: 'simple', title: `Update ${r.token}`, lines: ch } };
     },
     async run(ctx, a) {
@@ -966,12 +998,18 @@ export const TOOLS = [
       const n = nightsOf(b);
       const guests = a.guests ?? r.guests; const plan = a.meal_plan ?? r.meal_plan; const price = a.price ?? r.price;
       const cost = hb.is_own ? 0 : (a.partner_price ?? (a.price !== undefined && r.cost === (r.price ?? 0) ? a.price : r.cost));
-      await col(ctx, 'booking_rooms').update(byOwner(ctx, { id: r.id }), { $set: { guests: guests ?? null, meal_plan: plan ?? null, price: price ?? null, cost } });
+      const oldSk = { shikara: r.shikara ?? null, shikara_price: r.shikara_price ?? null };
+      const sk = a.shikara !== undefined || a.shikara_price !== undefined
+        ? cleanShikara({ shikara: a.shikara ?? (a.shikara_price !== undefined ? true : oldSk.shikara ?? undefined), shikara_price: a.shikara_price ?? (a.shikara === false ? undefined : oldSk.shikara_price ?? undefined) })
+        : oldSk;
+      await col(ctx, 'booking_rooms').update(byOwner(ctx, { id: r.id }), { $set: { guests: guests ?? null, meal_plan: plan ?? null, price: price ?? null, cost, ...sk } });
+      const dSk = shikaraAmount(sk) - shikaraAmount(oldSk);
+      if (dSk) await addLedger(ctx, { booking: b.id, side: 'CLIENT', type: 'CHARGE', amount: dSk, note: `Shikara ride ${r.token}: ${sTxt(sk)}` });
       if ((price ?? 0) !== (r.price ?? 0)) await addLedger(ctx, { booking: b.id, side: 'CLIENT', type: 'CHARGE', amount: ((price ?? 0) - (r.price ?? 0)) * n, note: `Price change ${r.token}: ${r.price ?? 'pending'} to ${price} per night` });
       if (cost !== r.cost) await addLedger(ctx, { booking: b.id, houseboat: hb.id, side: 'PARTNER', type: 'CHARGE', amount: (cost - r.cost) * n, note: `Houseboat price change ${r.token}` });
-      return { booking_id: b.id, token: r.token, guests, meal_plan: plan, price, pending: isPending({ guests, meal_plan: plan, price }) };
+      return { booking_id: b.id, token: r.token, guests, meal_plan: plan, price, ...sk, pending: isPending({ guests, meal_plan: plan, price, ...sk }) };
     },
-    confirmText: (r) => `Done. ${r.token} in booking #${r.booking_id} updated: ${gTxt(r.guests)}, ${mTxt(r.meal_plan)}, ${pTxt(r.price)}.${r.pending ? ' Some details are still pending.' : ''}`,
+    confirmText: (r) => `Done. ${r.token} in booking #${r.booking_id} updated: ${gTxt(r.guests)}, ${mTxt(r.meal_plan)}, ${pTxt(r.price)}, ${sTxt(r)}.${r.pending ? ' Some details are still pending.' : ''}`,
   },
   {
     name: 'set_meal_plans',
@@ -1044,6 +1082,59 @@ export const TOOLS = [
       return { count, summary: [...tally].map(([k, n]) => `${k} (${n})`).join(', ') };
     },
     confirmText: (r) => `Done. Meal plan changed for ${r.count} room${r.count === 1 ? '' : 's'}: ${r.summary}.`,
+  },
+  {
+    name: 'set_shikara',
+    description: 'Set the SHIKARA RIDE (included or not, and its price) for MANY rooms of one booking in ONE call: all rooms, the rooms of one houseboat, or a list of tokens. Use for "all rooms shikara included, 500 each", "Chinar rooms no shikara", "CHI001 and CHI002 shikara 800". The price is per room, charged once (not per night). For one room you may also use update_room.',
+    write: true,
+    parameters: {
+      type: 'object',
+      properties: {
+        booking_id: I('Booking number'),
+        included: { type: 'boolean', description: 'true = shikara ride included for these rooms, false = not included' },
+        price: I('Shikara ride price per room in rupees (once per room). Leave out if not known yet.'),
+        houseboat: S('Only the rooms on this houseboat (optional)'),
+        tokens: S('Only these room tokens, comma separated, e.g. "CHI001, CHI002" (optional)'),
+      },
+      required: ['booking_id', 'included'],
+    },
+    async prepare(ctx, a) {
+      const b = await getBooking(ctx, a.booking_id);
+      if (b.status === 'cancelled') throw new ToolError(`Booking #${b.id} is cancelled.`);
+      const row = (await bookingRows(ctx, { bookingId: b.id }))[0];
+      let rooms = row.rooms;
+      if (a.houseboat) { const hb = await findHouseboat(ctx, a.houseboat); rooms = rooms.filter((r) => r.houseboat === hb.name); }
+      if (a.tokens) {
+        const want = new Set(String(a.tokens).toUpperCase().split(/[\s,]+/).filter(Boolean));
+        const missing = [...want].filter((t) => !rooms.some((r) => r.token === t));
+        if (missing.length) throw new ToolError(`Booking #${b.id} has no room ${missing.join(', ')}.`);
+        rooms = rooms.filter((r) => want.has(r.token));
+      }
+      if (!rooms.length) throw new ToolError(`No rooms of booking #${b.id} match.`);
+      const next = cleanShikara({ shikara: a.included, shikara_price: a.included ? a.price : undefined });
+      const changes = rooms.filter((r) => r.shikara !== next.shikara || r.shikara_price !== next.shikara_price);
+      if (!changes.length) throw new ToolError('Those rooms already have that shikara setting. Nothing to change.');
+      const d = sum(changes, (r) => shikaraAmount(next) - shikaraAmount(r));
+      const what = next.shikara ? `shikara ride included${next.shikara_price != null ? `, ${inr(next.shikara_price)} per room` : ' (price pending)'}` : 'no shikara ride';
+      const lns = [`${changes.map((r) => r.token).join(', ')}: ${what}.`, d ? `Client total ${d > 0 ? '+' : '-'}${inr(Math.abs(d))}.` : '', next.shikara && next.shikara_price == null ? 'Tell me the price later and I will add it.' : ''].filter(Boolean);
+      const title = `Shikara ride for ${changes.length} room${changes.length === 1 ? '' : 's'} of booking #${b.id}`;
+      return { args: { booking_id: b.id, tokens: changes.map((r) => r.token), ...next }, summary: lines(`${title} - ${b.client_name}`, lns), preview: { kind: 'simple', title, lines: lns } };
+    },
+    async run(ctx, a) {
+      const b = await getBooking(ctx, a.booking_id);
+      const next = { shikara: a.shikara ?? null, shikara_price: a.shikara_price ?? null };
+      let delta = 0;
+      for (const t of a.tokens || []) {
+        const r = await col(ctx, 'booking_rooms').one(byOwner(ctx, { booking_id: b.id, token: upper(t) }));
+        if (!r) throw new ToolError(`Room ${t} of booking #${b.id} was not found.`);
+        delta += shikaraAmount(next) - shikaraAmount({ shikara: r.shikara ?? null, shikara_price: r.shikara_price ?? null });
+        await col(ctx, 'booking_rooms').update(byOwner(ctx, { id: r.id }), { $set: next });
+      }
+      if (delta) await addLedger(ctx, { booking: b.id, side: 'CLIENT', type: 'CHARGE', amount: delta, note: `Shikara rides: ${(a.tokens || []).join(', ')}` });
+      const row = (await bookingRows(ctx, { bookingId: b.id }))[0];
+      return { booking_id: b.id, count: (a.tokens || []).length, ...next, client_total: row.billed, client_due: row.balance };
+    },
+    confirmText: (r) => `Done. Shikara ride ${r.shikara ? `included${r.shikara_price != null ? ` (${inr(r.shikara_price)} per room)` : ' (price pending)'}` : 'not included'} for ${r.count} room${r.count === 1 ? '' : 's'} of booking #${r.booking_id}. Client total ${inr(r.client_total)}, due ${inr(r.client_due)}.`,
   },
   {
     name: 'update_booking',
@@ -1141,14 +1232,14 @@ export const TOOLS = [
       const have = await col(ctx, 'booking_rooms').count(byOwner(ctx, { booking_id: b.id }));
       const total = have + rooms.length;
       if (total > MAX_ROOMS * 5) throw new ToolError('Too many rooms in one booking.');
-      const dClient = sum(rooms, (r) => r.price) * nights.length;
+      const dClient = sum(rooms, (r) => r.price) * nights.length + sum(rooms, shikaraAmount);
       const lns = [
         ...rooms.map((r) => roomLine(r)),
         dClient ? `Client total +${inr(dClient)}.` : '',
         b.rooms_required ? `Rooms: ${total} allocated of ${b.rooms_required} required${total > b.rooms_required ? ' (more than required)' : `, ${b.rooms_required - total} left`}.` : `Booking will have ${total} rooms.`,
       ].filter(Boolean);
       return {
-        args: { booking_id: b.id, rooms: rooms.map((r) => ({ houseboat: r.houseboat, own: r.own, room_no: r.room_no, guests: r.guests, meal_plan: r.meal_plan, price: r.price, cost: r.cost })) },
+        args: { booking_id: b.id, rooms: rooms.map((r) => ({ houseboat: r.houseboat, own: r.own, room_no: r.room_no, guests: r.guests, meal_plan: r.meal_plan, price: r.price, cost: r.cost, shikara: r.shikara ?? undefined, shikara_price: r.shikara_price ?? undefined })) },
         summary: lines(`Add ${rooms.length} room${rooms.length > 1 ? 's' : ''} to booking #${b.id} - ${b.client_name}:`, lns), preview: { kind: 'simple', title: `Add rooms to booking #${b.id} - ${b.client_name}`, lines: lns },
       };
     },
@@ -1156,7 +1247,7 @@ export const TOOLS = [
       const b = await getBooking(ctx, a.booking_id);
       const nights = nightsBetween(b.check_in, b.check_out);
       const saved = await saveRooms(ctx, b.id, a.rooms, nights);
-      await chargeRooms(ctx, b.id, saved, nights.length, `Rooms added to booking #${b.id}`);
+      await chargeRooms(ctx, b.id, saved, nights.length, `Rooms added to booking #${b.id}`, { withShikara: true });
       const row = (await bookingRows(ctx, { bookingId: b.id }))[0];
       return { booking_id: b.id, added: saved, allocated: row.rooms_allocated, required: row.rooms_required, client_total: row.billed, client_due: row.balance };
     },
@@ -1177,7 +1268,7 @@ export const TOOLS = [
       if (!r) throw new ToolError(`Booking #${b.id} has no room ${a.token}.`);
       if (row.rooms.length === 1) throw new ToolError(`${r.token} is the only room in booking #${b.id}. Cancel the booking instead.`);
       const n = row.nights;
-      const lns = [`${r.token} (${r.houseboat}) becomes free.`, r.price ? `Client total -${inr(r.price * n)}.` : '', r.cost ? `You owe ${r.houseboat} ${inr(r.cost * n)} less.` : ''].filter(Boolean);
+      const lns = [`${r.token} (${r.houseboat}) becomes free.`, (r.price || shikaraAmount(r)) ? `Client total -${inr((r.price || 0) * n + shikaraAmount(r))}${shikaraAmount(r) ? ' (with its shikara ride)' : ''}.` : '', r.cost ? `You owe ${r.houseboat} ${inr(r.cost * n)} less.` : ''].filter(Boolean);
       return { args: { booking_id: b.id, token: r.token }, summary: lines(`Remove ${r.token} from booking #${b.id} - ${b.client_name}`, lns), preview: { kind: 'simple', title: `Remove ${r.token} from booking #${b.id}`, lines: lns } };
     },
     async run(ctx, a) {
@@ -1188,6 +1279,7 @@ export const TOOLS = [
       await col(ctx, 'room_night_locks').remove(byOwner(ctx, { booking_id: b.id, houseboat_id: r.houseboat_id, room_no: r.room_no }));
       await col(ctx, 'booking_rooms').remove(byOwner(ctx, { id: r.id }));
       if (r.price) await addLedger(ctx, { booking: b.id, side: 'CLIENT', type: 'CHARGE', amount: -r.price * n, note: `Room ${r.token} removed` });
+      if (shikaraAmount(r)) await addLedger(ctx, { booking: b.id, side: 'CLIENT', type: 'CHARGE', amount: -shikaraAmount(r), note: `Shikara ride of ${r.token} removed` });
       if (r.cost) await addLedger(ctx, { booking: b.id, houseboat: r.houseboat_id, side: 'PARTNER', type: 'CHARGE', amount: -r.cost * n, note: `Room ${r.token} removed` });
       const row = (await bookingRows(ctx, { bookingId: b.id }))[0];
       return { booking_id: b.id, token: r.token, rooms_left: row.rooms_allocated, client_total: row.billed, client_due: row.balance };

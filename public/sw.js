@@ -1,6 +1,6 @@
 // Makes BoatHouse installable and keeps the app shell available when the network drops.
 // Live data (/api/...) is never cached, so bookings and money are always fresh and private.
-const CACHE = 'boathouse-shell-v11';
+const CACHE = 'boathouse-shell-v12';
 const SHELL = ['/', '/styles.css', '/app.js', '/translit.js', '/theme.js', '/config.js', '/manifest.webmanifest', '/icons/icon-192.png'];
 
 self.addEventListener('install', (e) => {
