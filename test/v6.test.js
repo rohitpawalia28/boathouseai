@@ -286,3 +286,21 @@ test('an owner can update their own API key: it is checked with Google first, a 
   assert.equal((await api('POST', '/api/my-ai-key', { token: ADMIN, body: { key: good } })).status, 403);
   assert.equal((await api('POST', '/api/my-ai-key', { body: { key: good } })).status, 401);
 });
+
+test('ADMIN_EMAIL + ADMIN_PASSWORD in .env create the admin on start, once, and never overwrite it', async () => {
+  const st = await openStore(TEST_URI, storeOpts());
+  const make = () => createApp({ store: st, secret: 's', provider: null, adminEmail: 'Boss@Mail.com'.toLowerCase(), adminPassword: 'Start-pass-123', adminName: 'Rohit' });
+  const a1 = await make();
+  const admin = await st.c('owners').one({ email: 'boss@mail.com' });
+  assert.equal(admin.role, 'admin'); assert.equal(admin.name, 'Rohit');
+  await new Promise((r) => a1.server.listen(0, r));
+  const base1 = `http://localhost:${a1.server.address().port}`;
+  const login = await (await fetch(base1 + '/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: 'boss@mail.com', password: 'Start-pass-123' }) })).json();
+  assert.equal(login.owner.role, 'admin');
+  a1.server.close();
+  const hash = admin.password_hash;
+  await make(); // a restart does not create a second admin or change the password
+  assert.equal(await st.c('owners').count({ email: 'boss@mail.com' }), 1);
+  assert.equal((await st.c('owners').one({ email: 'boss@mail.com' })).password_hash, hash);
+  await cleanup(st);
+});

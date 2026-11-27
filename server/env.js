@@ -27,6 +27,10 @@ export function getConfig(overrides = {}) {
     geminiModel: env.GEMINI_MODEL || 'gemini-flash-lite-latest',
     secret: env.JWT_SECRET || '',
     allowSignup: env.ALLOW_SIGNUP === 'true',
+    // The admin login, made automatically on start if it does not exist yet (never overwrites an existing account)
+    adminEmail: (env.ADMIN_EMAIL || '').trim().toLowerCase(),
+    adminPassword: env.ADMIN_PASSWORD || '',
+    adminName: (env.ADMIN_NAME || 'Admin').trim(),
     contactInfo: (env.CONTACT_INFO || '').trim(), // shown to customers whose trial ended, e.g. "WhatsApp 98xxxxxx"
     corsOrigins: (env.CORS_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean),
     tz: env.APP_TZ || 'Asia/Kolkata',

@@ -16,6 +16,21 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
 const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.svg': 'image/svg+xml', '.png': 'image/png', '.ico': 'image/x-icon', '.json': 'application/json', '.webmanifest': 'application/manifest+json' };
 
+// ADMIN_EMAIL + ADMIN_PASSWORD in .env: the admin account is created on the first start.
+// If that email already exists nothing is changed (so a password changed later in the app stays).
+async function ensureAdmin(cfg, owners) {
+  if (!cfg.adminEmail && !cfg.adminPassword) return;
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(cfg.adminEmail)) return console.warn('[admin] ADMIN_EMAIL in .env does not look like an email. No admin was created.');
+  const old = await owners.one({ email: cfg.adminEmail });
+  if (old) {
+    if (old.role !== 'admin') console.warn(`[admin] ${cfg.adminEmail} is a boat-owner account, so it was not made admin. Use another email for ADMIN_EMAIL.`);
+    return;
+  }
+  if (cfg.adminPassword.length < 8) return console.warn('[admin] ADMIN_PASSWORD in .env must be at least 8 characters. No admin was created.');
+  await owners.insert(ownerDoc({ name: cfg.adminName || 'Admin', email: cfg.adminEmail, password_hash: await hashPassword(cfg.adminPassword), role: 'admin' }));
+  console.log(`[admin] Admin login created: ${cfg.adminEmail}. You can now remove ADMIN_PASSWORD from .env.`);
+}
+
 class HttpError extends Error {
   constructor(status, message, code) { super(message); this.status = status; this.code = code; }
 }
@@ -24,6 +39,7 @@ export async function createApp(overrides = {}) {
   const cfg = getConfig(overrides);
   const store = overrides.store || await openStore(cfg.mongoUri, { dbName: cfg.mongoDb });
   const owners = store.c('owners');
+  await ensureAdmin(cfg, owners);
   const provider = overrides.provider !== undefined ? overrides.provider : cfg.geminiKey ? geminiProvider({ apiKey: cfg.geminiKey, model: cfg.geminiModel }) : null;
   const authLimiter = makeLimiter(overrides.loginsPerWindow || 20, 10 * 60 * 1000);
   const emailLimiter = makeLimiter(10, 15 * 60 * 1000); // per account, so many IPs together cannot guess one password

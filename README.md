@@ -28,7 +28,8 @@ cd boathouse-ai
 npm install                   # installs the MongoDB driver (the only package)
 cp .env.example .env          # Windows: copy .env.example .env
 # open .env and fill in:  MONGODB_URI=...   GEMINI_API_KEY=...
-npm run add-admin             # your admin login (see "Giving the app to boat owners")
+# also in .env: ADMIN_EMAIL and ADMIN_PASSWORD -> the admin login is created on the first start
+# (or make it by hand: npm run add-admin)
 npm run seed                  # optional: demo bookings  (login demo@boathouse.local / demo12345)
 npm start
 ```
