@@ -16,7 +16,8 @@ review popup, then saves the booking and gives **one token per room** (first 3 l
 
 | Need | Why | Check |
 |---|---|---|
-| Node.js **22.13 or newer** | runs the server (it uses Node's built-in SQLite, so there is **no database to install** and **no `npm install`**) | `node -v` |
+| Node.js **22.13 or newer** | runs the server | `node -v` |
+| A free MongoDB Atlas database | keeps all the data (accounts, bookings, money, chat) | https://www.mongodb.com/cloud/atlas |
 | Chrome or Edge | voice input (Firefox/Safari have no speech recognition) | |
 | A free Gemini API key | the AI brain | https://aistudio.google.com/apikey |
 
@@ -24,8 +25,10 @@ review popup, then saves the booking and gives **one token per room** (first 3 l
 
 ```bash
 cd boathouse-ai
+npm install                   # installs the MongoDB driver (the only package)
 cp .env.example .env          # Windows: copy .env.example .env
-# open .env and paste your key:  GEMINI_API_KEY=...
+# open .env and fill in:  MONGODB_URI=...   GEMINI_API_KEY=...
+npm run add-admin             # your admin login (see "Giving the app to boat owners")
 npm run seed                  # optional: demo bookings  (login demo@boathouse.local / demo12345)
 npm start
 ```
@@ -38,6 +41,26 @@ npm run reset-password -- owner@email  # sets a new password for someone who for
 ```
 
 Then open http://localhost:3000, log in and start chatting.
+
+### MongoDB Atlas in 5 steps
+
+1. Create a free cluster at https://www.mongodb.com/cloud/atlas (any region near you, e.g. Mumbai).
+2. **Database Access** → add a user, e.g. `boathouse_app`, with a long random password and the role *Read and write to any database* (or, better, `readWrite` on the `boathouse` database only).
+3. **Network Access** → add your own IP for testing. For Render add `0.0.0.0/0` (Render's free plan has no fixed IP), which is why the long password matters.
+4. **Connect → Drivers** → copy the `mongodb+srv://...` string, put your password in it and add the database name before the `?`: `...mongodb.net/boathouse?retryWrites=true&w=majority`.
+5. Paste it as `MONGODB_URI` in `.env` (and later in Render). Never commit it.
+
+### Moving your old data from SQLite
+
+If you used the earlier version, your data is in `data/boathouse.db`. Copy it into MongoDB once:
+
+```bash
+npm run migrate-to-mongo      # reads data/boathouse.db, writes into the (empty) MongoDB database from .env
+```
+
+Every id stays the same (booking #12 stays #12) and every password keeps working. The SQLite file is only read; keep it as a backup.
+It refuses to copy into a database that already has accounts, so nothing can get mixed or duplicated.
+Also copy the value of `data/.secret` into `JWT_SECRET` (in `.env` and on Render): with the same secret, logins and saved customer AI keys keep working.
 
 ### Login rules
 - **One login at a time.** When an owner logs in on a new phone or browser, every older login is signed out. The old device sees a message saying the account was opened on another device.
@@ -76,11 +99,11 @@ Set `CONTACT_INFO` in `.env` (for example a phone number) to add it to the "cont
 
 All customers share one database, but every query is filtered by owner, so one owner never sees another's data.
 
-**Database note:** this app stores data in SQLite (`data/boathouse.db`), not MongoDB. Moving a customer to their own database is not built; use **Download data** to give them their data.
+**Database note:** all customers share your MongoDB database. **Download data** gives you one customer's full data as a JSON file (for example before moving them to their own database, which is not built yet).
 
 ## Security
 
-- **Secrets never go to GitHub.** `.env`, `data/` (the database and `data/.secret`) and backups are in `.gitignore`. Only `.env.example` (empty values) is committed.
+- **Secrets never go to GitHub.** `.env` (with the MongoDB connection string), `data/` and backups are in `.gitignore`. Only `.env.example` (empty values) is committed.
 - **Passwords** are stored as scrypt hashes. API keys of customers are stored encrypted (AES-256-GCM). Neither is ever sent to the browser.
 - **Everything is checked on the server.** The browser only shows data. Changing the page, the JavaScript or the browser storage cannot unlock a trial, open the admin screen, or reach another owner's data: every request is checked for a valid signed token, the account's role, its trial or lock, and the owner of each row.
 - **Login tokens** are signed (HMAC-SHA256) and cannot be edited. Logging in on a new device signs out the old one. Changing or resetting a password signs out everywhere.
@@ -90,7 +113,10 @@ All customers share one database, but every query is filtered by owner, so one o
 - **Static files:** only files inside `public/` are served; hidden files (like `.env`) and `../` paths are refused.
 - `npm test` includes `test/security.test.js`, which tries these attacks and must pass.
 
-**When you host it:** use HTTPS, set a long random `JWT_SECRET`, set `TRUST_PROXY=true` behind Render / Railway / Nginx, keep `ALLOW_SIGNUP=false`, never run `npm run seed` on the live server (its demo password is public; it refuses when `NODE_ENV=production`), and back up `data/` every day. If `JWT_SECRET` changes, everyone must log in again and saved customer AI keys must be entered again.
+- **Database:** the MongoDB user only needs `readWrite` on the `boathouse` database. Use a long random password (the Atlas network list is open to Render). Atlas keeps the data encrypted at rest; turn on its backups (paid tiers) or export regularly.
+- **Bookings in MongoDB:** a database rule refuses any booking without a real sender, a unique key per room and night makes double booking impossible, and every confirmed change runs in one transaction (all or nothing). The ledger is append-only in the app: there is no code path that edits an entry, and entries are removed only by a confirmed "delete booking" / "delete all".
+
+**When you host it:** use HTTPS, set a long random `JWT_SECRET` (the server refuses to start without it when `NODE_ENV=production`), set `TRUST_PROXY=true` behind Render / Railway / Nginx, keep `ALLOW_SIGNUP=false`, and never run `npm run seed` on the live database (its demo password is public; it refuses when `NODE_ENV=production`). If `JWT_SECRET` changes, everyone must log in again and saved customer AI keys must be entered again.
 
 ## Things to try (say or type)
 
@@ -125,32 +151,37 @@ Mic / keyboard -> editable text box -> POST /api/chat
    -> server validates the arguments and runs the tool for the logged-in owner only
    -> read tool: result goes back to Gemini, which explains it in English
    -> write tool: server stores a pending action and shows a Confirm card
-   -> Confirm (button or "haan") -> one atomic database transaction -> dashboard refreshes
+   -> Confirm (button or "haan") -> one MongoDB transaction (all or nothing) -> dashboard refreshes
 ```
 
 Key rules (from the Phase 1 architecture PDF):
-- `room_night_locks` has `UNIQUE(houseboat_id, room_no, stay_date)`, so two bookings can never take the same room token on the same night. Room numbers are given automatically (lowest free number), so overlapping bookings on one houseboat get CUL001, CUL002, CUL003...
-- `ledger` is append-only (database triggers block UPDATE and DELETE).
+- Each `room_night_locks` document has the key `houseboat:room:date`, so two bookings can never take the same room token on the same night. Room numbers are given automatically (lowest free number), so overlapping bookings on one houseboat get CUL001, CUL002, CUL003...
+- `ledger` is append-only: the data layer refuses to edit or delete entries (only a confirmed delete of bookings removes them).
 - The AI only chooses from a fixed tool list; unknown tools or bad arguments are rejected.
 - The confirmation text is written by the server, so it always matches what will be saved.
 
-Upgrading: from the very first version the old test data is cleared automatically (your login is kept). From the later versions (houseboats + tokens) **nothing is lost**: the database upgrades itself on start. Bookings made before the sender rule show "Sender: –" until you set one (`Change sender of booking 5 to ...`).
+Upgrading from the SQLite version: run `npm run migrate-to-mongo` once (see above). Bookings made before the sender rule get the sender "Old booking (no sender)"; change it any time (`Change sender of booking 5 to ...`).
 
 **Dashboard tabs:** Overview (with "details pending" and "rooms to allocate" alerts), Bookings (search by client or sender, day view with vacant rooms), Houseboats, Money, Calendar, **Clients** (clients and senders built automatically from your bookings, with totals and dues), **Reports** (month by month revenue by houseboat and by sender).
 
 Files: `server/tools.js` (all business logic and the tool list), `server/chat.js` (AI loop + confirm gate),
-`server/ai.js` (Gemini adapter; swap it to use another model), `public/` (the whole UI, no build step).
+`server/store.js` (MongoDB: collections, indexes, transactions), `server/ai.js` (Gemini adapter; swap it to use another model),
+`public/` (the whole UI, no build step). Tests run on a small in-memory stand-in (`server/memory-mongo.js`), so `npm test` needs no database.
+To run the same tests on real MongoDB, set `TEST_MONGODB_URI` in `.env` and run `npm run test:atlas` (each run uses temporary `bh_test_...` databases and empties them).
 
-## Putting it online later (GitHub, then Netlify)
+## Putting it online (Render + MongoDB Atlas)
 
-1. **GitHub**: `git init`, commit, push. `.env` and the `data/` folder are already in `.gitignore`. Never commit your API key.
-2. **Netlify hosts only the frontend** (the `public/` folder). The server must run somewhere that keeps running and keeps files
-   (Render, Railway, Fly.io, or a small VPS). Netlify cannot run this long-lived server.
-3. Deploy the server there with start command `npm start`, set the variables from `.env.example`, and set
-   `CORS_ORIGIN=https://your-site.netlify.app`.
-4. In `public/config.js` set `apiBase` to the server's URL, then deploy `public/` on Netlify.
-5. **Database warning**: the data lives in a SQLite file. Free hosting tiers often wipe local files on redeploy, so use a host with a
-   persistent disk/volume, or move the database to a hosted one (Postgres/Turso) before real customers use it. Take backups of `data/boathouse.db`.
+The server also serves the website, so one Render service is all you need (no Netlify, no disk: the data is in Atlas).
+
+1. Push the code to GitHub (`.env` and `data/` stay on your computer).
+2. On Render: **New → Blueprint** → pick the repo. It reads `render.yaml` and asks for:
+   - `MONGODB_URI`: your Atlas string (see above)
+   - `JWT_SECRET`: a long random string. If you copied old data, use the value of your `data/.secret` (or your old `JWT_SECRET`).
+   - `GEMINI_API_KEY` (optional shared key) and `CONTACT_INFO` (for example your WhatsApp number)
+3. Make your admin login from your own computer: put the same `MONGODB_URI` in your `.env` and run `npm run add-admin` (it writes straight into Atlas). Skip it if you copied your data and already have an admin.
+4. Open the `https://...onrender.com` link, log in, and add customers.
+
+The free plan sleeps after 15 minutes without visitors (the first visit then takes about a minute). Choose the Starter plan in Render to keep it always on.
 
 ## Not built yet (planned next)
 

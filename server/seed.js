@@ -1,7 +1,7 @@
 // Creates a demo owner with sample data so you can look around without typing everything.
 // Usage: npm run seed   ->  login demo@boathouse.local / demo12345
 import { loadEnv, getConfig } from './env.js';
-import { openDb } from './db.js';
+import { storeFromConfig, ownerDoc } from './store.js';
 import { hashPassword } from './auth.js';
 import { prepareWriteTool, executeWrite, addHouseboat } from './tools.js';
 import { addDays, todayStr } from './util.js';
@@ -10,18 +10,19 @@ loadEnv();
 // The demo login has a public password, so it must never exist on the live server.
 if (process.env.NODE_ENV === 'production') { console.error('npm run seed is only for your own computer (the demo password is public). Not run.'); process.exit(1); }
 const cfg = getConfig();
-const db = openDb(cfg.dbFile);
+const store = await storeFromConfig(cfg);
 const email = 'demo@boathouse.local';
-if (db.prepare('SELECT 1 FROM owners WHERE email = ?').get(email)) {
+if (await store.c('owners').one({ email })) {
   console.log('Demo owner already exists. Log in with demo@boathouse.local / demo12345');
+  await store.close();
   process.exit(0);
 }
-const id = Number(db.prepare('INSERT INTO owners(name, email, password_hash) VALUES(?,?,?)').run('Demo Owner', email, await hashPassword('demo12345')).lastInsertRowid);
-const ctx = { db, ownerId: id, ownerName: 'Demo Owner', tz: cfg.tz };
+const id = (await store.c('owners').insert(ownerDoc({ name: 'Demo Owner', email, password_hash: await hashPassword('demo12345') }))).id;
+const ctx = { store, ownerId: id, ownerName: 'Demo Owner', tz: cfg.tz };
 const today = todayStr(cfg.tz);
-addHouseboat(ctx, { name: 'Sunrise', total_rooms: 5, is_own: true });
-addHouseboat(ctx, { name: 'Chinar', total_rooms: 5 });
-addHouseboat(ctx, { name: 'Cultural Palace', total_rooms: 4 });
+await addHouseboat(ctx, { name: 'Sunrise', total_rooms: 5, is_own: true });
+await addHouseboat(ctx, { name: 'Chinar', total_rooms: 5 });
+await addHouseboat(ctx, { name: 'Cultural Palace', total_rooms: 4 });
 const rooms = (boat, n, price, plan, guests, own = false) => Array.from({ length: n }, (_, i) => ({ houseboat: boat, own, guests: Array.isArray(guests) ? guests[i] : guests, price, meal_plan: plan }));
 const steps = [
   ['create_booking', {
@@ -38,7 +39,8 @@ const steps = [
   }],
 ];
 for (const [tool, args] of steps) {
-  const prep = prepareWriteTool(ctx, tool, args);
-  console.log('-', executeWrite(ctx, tool, prep.args).message);
+  const prep = await prepareWriteTool(ctx, tool, args);
+  console.log('-', (await executeWrite(ctx, tool, prep.args)).message);
 }
 console.log('\nDemo ready. Log in with demo@boathouse.local / demo12345');
+await store.close();

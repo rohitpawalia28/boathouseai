@@ -4,8 +4,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createApp } from '../server/index.js';
+import { openStore, ownerDoc } from '../server/store.js';
 import { hashPassword } from '../server/auth.js';
 import { seal, open } from '../server/secretbox.js';
+import { TEST_URI, dbOpts, storeOpts, cleanup } from './testdb.js';
 
 const DAY = 86_400_000;
 const say = (text) => ({ parts: [{ text }], functionCalls: [], text });
@@ -31,16 +33,16 @@ async function makeCustomer(over = {}) {
 }
 
 before(async () => {
-  app = createApp({ chatPerMinute: 100000, loginsPerWindow: 100000, dbFile: ':memory:', secret: 'test-secret', provider: sharedAi, providerFactory: keyed, now: () => clock });
+  app = await createApp({ chatPerMinute: 100000, loginsPerWindow: 100000, ...dbOpts(), secret: 'test-secret', provider: sharedAi, providerFactory: keyed, now: () => clock });
   await new Promise((r) => app.server.listen(0, r));
   base = `http://localhost:${app.server.address().port}`;
-  app.db.prepare("INSERT INTO owners(name, email, password_hash, role, plan) VALUES('Admin','admin@x.com',?,'admin','full')").run(await hashPassword('AdminPass#123'));
+  await app.store.c('owners').insert(ownerDoc({ name: 'Admin', email: 'admin@x.com', password_hash: await hashPassword('AdminPass#123'), role: 'admin' }));
   const r = await login('admin@x.com', 'AdminPass#123');
   assert.equal(r.status, 200);
   assert.equal(r.data.owner.role, 'admin');
   ADMIN = r.data.token;
 });
-after(() => app.server.close());
+after(async () => { app.server.close(); await cleanup(app.store); });
 
 test('admin and owners are kept apart: owners cannot open admin pages, admin has no houseboat data', async () => {
   const c = await makeCustomer({ password: 'owner-pass-1' });
@@ -168,7 +170,7 @@ test('each customer uses their OWN Gemini key; the key is stored encrypted and n
   assert.equal(list.find((x) => x.id === a.owner.id).ai_calls, 1);
   assert.equal(list.find((x) => x.id === b.owner.id).ai_calls, 2);
   // the plain key is nowhere: not in the database row, not in any admin answer
-  const row = app.db.prepare('SELECT gemini_key_enc FROM owners WHERE id = ?').get(a.owner.id);
+  const row = await app.store.c('owners').one({ id: a.owner.id });
   assert.ok(row.gemini_key_enc.startsWith('v1.'));
   assert.ok(!row.gemini_key_enc.includes(KEY_A));
   assert.equal(open(row.gemini_key_enc, 'test-secret'), KEY_A);
@@ -240,14 +242,14 @@ test('creating a customer is checked: email, duplicates, days, key shape; paid c
 });
 
 test('an unreadable key (server secret changed) never falls back to the shared key', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bh6-'));
-  const file = path.join(dir, 't.db');
-  const a1 = createApp({ dbFile: file, secret: 'secret-one', provider: sharedAi, providerFactory: keyed, now: () => clock });
+  // the same database, opened by a server with a different secret
+  const shared = await openStore(TEST_URI, storeOpts());
+  const a1 = await createApp({ store: shared, secret: 'secret-one', provider: sharedAi, providerFactory: keyed, now: () => clock });
   await new Promise((r) => a1.server.listen(0, r));
   const b1 = `http://localhost:${a1.server.address().port}`;
-  a1.db.prepare("INSERT INTO owners(name, email, password_hash, role, plan, gemini_key_enc) VALUES('Boat','boat@x.com',?,'owner','full',?)").run(await hashPassword('boat-pass-12'), seal(KEY_A, 'secret-one'));
-  a1.server.close(); a1.db.close();
-  const a2 = createApp({ dbFile: file, secret: 'secret-two', provider: sharedAi, providerFactory: keyed, now: () => clock });
+  await shared.c('owners').insert(ownerDoc({ name: 'Boat', email: 'boat@x.com', password_hash: await hashPassword('boat-pass-12'), gemini_key_enc: seal(KEY_A, 'secret-one') }));
+  a1.server.close();
+  const a2 = await createApp({ store: shared, secret: 'secret-two', provider: sharedAi, providerFactory: keyed, now: () => clock });
   await new Promise((r) => a2.server.listen(0, r));
   const b2 = `http://localhost:${a2.server.address().port}`;
   const l = await (await fetch(b2 + '/api/auth/login', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: 'boat@x.com', password: 'boat-pass-12' }) })).json();
@@ -255,7 +257,7 @@ test('an unreadable key (server secret changed) never falls back to the shared k
   const r = await (await fetch(b2 + '/api/chat', { method: 'POST', headers: { 'content-type': 'application/json', authorization: `Bearer ${l.token}` }, body: JSON.stringify({ message: 'summary' }) })).json();
   assert.equal(r.simple, true, 'simple mode instead of silently spending the shared key');
   assert.deepEqual(used, []);
-  a2.server.close(); a2.db.close();
+  a2.server.close(); await cleanup(shared);
   void b1;
 });
 

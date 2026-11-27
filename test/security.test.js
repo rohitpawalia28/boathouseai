@@ -4,8 +4,10 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { createApp } from '../server/index.js';
+import { ownerDoc } from '../server/store.js';
 import { hashPassword, signToken } from '../server/auth.js';
 import { addDays, todayStr } from '../server/util.js';
+import { TEST_URI, dbOpts, storeOpts, cleanup } from './testdb.js';
 
 const call = (name, args) => ({ parts: [{ functionCall: { name, args } }], functionCalls: [{ name, args }], text: '' });
 const say = (text) => ({ parts: [{ text }], functionCalls: [], text });
@@ -23,7 +25,7 @@ async function api(method, p, { token, body, headers = {} } = {}) {
 }
 const login = (email, password) => api('POST', '/api/auth/login', { body: { email, password } });
 async function makeUser(email, role = 'owner') {
-  app.db.prepare("INSERT INTO owners(name, email, password_hash, role, plan) VALUES(?,?,?,?,'full')").run(email.split('@')[0], email, await hashPassword('password123'), role);
+  await app.store.c('owners').insert(ownerDoc({ name: email.split('@')[0], email, password_hash: await hashPassword('password123'), role }));
   const r = await login(email, 'password123');
   assert.equal(r.status, 200, JSON.stringify(r.data));
   return r.data.token;
@@ -37,7 +39,7 @@ async function propose(token, tool, args) {
 const confirm = (token, t) => api('POST', '/api/confirm', { token, body: { token: t, approve: true } });
 
 before(async () => {
-  app = createApp({ dbFile: ':memory:', secret: SECRET, provider: ai, now: () => clock });
+  app = await createApp({ ...dbOpts(), secret: SECRET, provider: ai, now: () => clock });
   await new Promise((r) => app.server.listen(0, r));
   base = `http://localhost:${app.server.address().port}`;
   A = await makeUser('alice@x.com');
@@ -47,10 +49,11 @@ before(async () => {
   assert.equal((await api('POST', '/api/houseboats', { token: A, body: { name: 'Alice Boat', total_rooms: 3, is_own: true } })).status, 200);
   const p = await propose(A, 'create_booking', { client_name: 'Secret Guest', sender: 'Direct', check_in: D(3), check_out: D(4), advance_paid: 1000, rooms: [{ houseboat: 'Alice Boat', own: true, guests: 2, price: 5000, meal_plan: 'CP' }] });
   assert.equal((await confirm(A, p.pending.token)).status, 200);
-  bookingA = app.db.prepare("SELECT id FROM bookings WHERE client_name = 'Secret Guest'").get().id;
-  entryA = app.db.prepare("SELECT l.id FROM ledger l JOIN owners o ON o.id = l.owner_id WHERE o.email = 'alice@x.com' AND l.amount > 0 LIMIT 1").get()?.id;
+  bookingA = (await app.store.c('bookings').one({ client_name: 'Secret Guest' })).id;
+  const alice = await app.store.c('owners').one({ email: 'alice@x.com' });
+  entryA = (await app.store.c('ledger').one({ owner_id: alice.id, amount: { $lt: 0 } }))?.id; // the advance payment
 });
-after(() => app.server.close());
+after(async () => { app.server.close(); await cleanup(app.store); });
 
 test('another owner sees none of my data', async () => {
   for (const p of ['/api/bookings', '/api/houseboats', '/api/dashboard', '/api/balance', '/api/history', `/api/people?q=Secret`, `/api/calendar?from=${D(0)}`]) {
@@ -61,7 +64,7 @@ test('another owner sees none of my data', async () => {
 });
 
 test('another owner cannot delete or reverse my booking, boat or payment by id', async () => {
-  const boatA = app.db.prepare("SELECT id FROM houseboats WHERE name = 'Alice Boat'").get().id;
+  const boatA = (await app.store.c('houseboats').one({ name: 'Alice Boat' })).id;
   assert.equal((await api('POST', '/api/delete-request', { token: B, body: { kind: 'houseboat', id: boatA } })).status, 404);
   const del = await api('POST', '/api/delete-request', { token: B, body: { kind: 'booking', id: bookingA } });
   assert.notEqual(del.status, 200, 'B must not even get a delete card for A\'s booking');
@@ -70,7 +73,7 @@ test('another owner cannot delete or reverse my booking, boat or payment by id',
   // the AI route is scoped the same way
   const viaChat = await propose(B, 'delete_booking', { booking_id: bookingA });
   assert.ok(!viaChat.pending, 'no confirm card for someone else\'s booking');
-  assert.equal(app.db.prepare("SELECT status FROM bookings WHERE id = ?").get(bookingA).status, 'confirmed');
+  assert.equal((await app.store.c('bookings').one({ id: bookingA })).status, 'confirmed');
 });
 
 test('another owner cannot approve my confirmation card', async () => {
@@ -78,13 +81,13 @@ test('another owner cannot approve my confirmation card', async () => {
   assert.ok(p.pending?.token);
   const r = await confirm(B, p.pending.token);
   assert.notEqual(r.status, 200);
-  assert.equal(app.db.prepare("SELECT status FROM pending_actions WHERE token = ?").get(p.pending.token).status, 'pending');
+  assert.equal((await app.store.c('pending_actions').one({ token: p.pending.token })).status, 'pending');
   await api('POST', '/api/confirm', { token: A, body: { token: p.pending.token, approve: false } });
 });
 
 test('forged, edited or alg=none tokens are refused', async () => {
-  const aliceId = app.db.prepare("SELECT id FROM owners WHERE email = 'alice@x.com'").get().id;
-  const sv = app.db.prepare('SELECT session_version FROM owners WHERE id = ?').get(aliceId).session_version;
+  const aliceRow = await app.store.c('owners').one({ email: 'alice@x.com' });
+  const aliceId = aliceRow.id; const sv = aliceRow.session_version;
   const forged = signToken({ sub: aliceId, sv }, 'wrong-secret');
   assert.equal((await api('GET', '/api/bookings', { token: forged })).status, 401);
   // take Bob's real token and change the user id inside it
@@ -104,11 +107,11 @@ test('roles are checked on the server: owners cannot use admin APIs, editing the
     const r = await api(m, p, { token: A, body: { action: 'make_full', name: 'Hacker', email: 'h@x.com' } });
     assert.equal(r.status, 403, `${m} ${p}`);
   }
-  assert.equal(app.db.prepare("SELECT COUNT(*) c FROM owners WHERE email = 'h@x.com'").get().c, 0);
+  assert.equal(await app.store.c('owners').count({ email: 'h@x.com' }), 0);
   // the admin has no houseboat data and cannot act as an owner
   assert.equal((await api('GET', '/api/bookings', { token: ADMIN })).status, 403);
   // the admin cannot touch another admin through the customer APIs
-  const adminId = app.db.prepare("SELECT id FROM owners WHERE email = 'boss@x.com'").get().id;
+  const adminId = (await app.store.c('owners').one({ email: 'boss@x.com' })).id;
   assert.equal((await api('POST', `/api/admin/owners/${adminId}/password`, { token: ADMIN, body: {} })).status, 404);
 });
 
@@ -142,7 +145,7 @@ test('passwords and AI keys are never sent to the browser', async () => {
   const c = await api('POST', '/api/admin/owners', { token: ADMIN, body: { name: 'Key Kim', email: 'kim@x.com', password: 'password123', gemini_key: key } });
   const all = JSON.stringify((await api('GET', '/api/admin/owners', { token: ADMIN })).data) + JSON.stringify(c.data);
   assert.ok(!all.includes(key) && !all.includes('scrypt$') && !all.includes('password_hash') && !all.includes('gemini_key_enc'));
-  const row = app.db.prepare("SELECT gemini_key_enc FROM owners WHERE email = 'kim@x.com'").get();
+  const row = await app.store.c('owners').one({ email: 'kim@x.com' });
   assert.ok(!row.gemini_key_enc.includes(key), 'the key is stored encrypted');
   const me = await api('GET', '/api/me', { token: A });
   assert.ok(!JSON.stringify(me.data).includes('scrypt'));
@@ -200,10 +203,35 @@ test('SQL injection in search fields does nothing', async () => {
     assert.ok(!JSON.stringify(r.data).includes('Secret Guest'));
     assert.equal((await api('GET', `/api/bookings?client=${encodeURIComponent(q)}`, { token: B })).status, 200);
   }
-  assert.ok(app.db.prepare('SELECT COUNT(*) c FROM bookings').get().c >= 1, 'bookings table still there');
+  assert.ok(await app.store.c('bookings').count({}) >= 1, 'bookings still there');
 });
 
-test('random ids are not guessable for confirmation cards', () => {
-  const rows = app.db.prepare('SELECT token FROM pending_actions').all();
+test('random ids are not guessable for confirmation cards', async () => {
+  const rows = await app.store.c('pending_actions').find({});
   assert.ok(rows.length && rows.every((r) => String(r.token).length >= 16));
+});
+
+test('all or nothing: when a room is taken between the card and Confirm, no half booking is saved; a double Confirm saves once', async () => {
+  const st = app.store;
+  const before = { b: await st.c('bookings').count({}), r: await st.c('booking_rooms').count({}), l: await st.c('ledger').count({}), k: await st.c('room_night_locks').count({}) };
+  // two cards that both want room ALI001 on the same night, plus a second room that would be saved first
+  const rooms = [{ houseboat: 'Alice Boat', own: true, guests: 2, price: 3000, meal_plan: 'CP', room_no: 2 }, { houseboat: 'Alice Boat', own: true, guests: 2, price: 3000, meal_plan: 'CP', room_no: 1 }];
+  const one = await propose(A, 'create_booking', { client_name: 'First', sender: 'Direct', check_in: D(40), check_out: D(41), rooms: [rooms[1]] });
+  const two = await propose(A, 'create_booking', { client_name: 'Second', sender: 'Direct', check_in: D(40), check_out: D(41), rooms });
+  // (each new card cancels the older one in the same chat, so put the first one back to "pending" to race them)
+  await st.c('pending_actions').update({ _id: one.pending.token }, { $set: { status: 'pending' } });
+  assert.equal((await confirm(A, one.pending.token)).data.status, 'confirmed');
+  const r = await confirm(A, two.pending.token);
+  assert.equal(r.data.status, 'failed', JSON.stringify(r.data));
+  assert.match(r.data.message, /just booked/);
+  // only the first booking's rows were added: nothing of "Second" (not even its first room) is left behind
+  assert.equal(await st.c('bookings').count({ client_name: 'Second' }), 0);
+  assert.equal(await st.c('bookings').count({}), before.b + 1);
+  assert.equal(await st.c('booking_rooms').count({}), before.r + 1);
+  assert.equal(await st.c('room_night_locks').count({}), before.k + 1);
+  assert.equal(await st.c('ledger').count({}), before.l + 1);
+  // tapping Confirm again on a saved card does nothing
+  const again = await confirm(A, one.pending.token);
+  assert.notEqual(again.data.status, 'failed');
+  assert.equal(await st.c('bookings').count({ client_name: 'First' }), 1);
 });

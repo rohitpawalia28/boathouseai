@@ -1,8 +1,8 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { createApp } from '../server/index.js';
-import { openDb } from '../server/db.js';
 import { addDays, todayStr } from '../server/util.js';
+import { TEST_URI, dbOpts, storeOpts, cleanup } from './testdb.js';
 
 function scripted() {
   const queue = [];
@@ -15,13 +15,13 @@ const D = (n) => addDays(todayStr('Asia/Kolkata'), n);
 let app, base, ai, T;
 before(async () => {
   ai = scripted();
-  app = createApp({ chatPerMinute: 100000, dbFile: ':memory:', secret: 'test-secret', provider: ai, allowSignup: true });
+  app = await createApp({ chatPerMinute: 100000, ...dbOpts(), secret: 'test-secret', provider: ai, allowSignup: true });
   await new Promise((r) => app.server.listen(0, r));
   base = `http://localhost:${app.server.address().port}`;
   const r = await api('POST', '/api/auth/register', { body: { name: 'Carol', email: 'carol@x.com', password: 'password123' } });
   T = r.data.token;
 });
-after(() => app.server.close());
+after(async () => { app.server.close(); await cleanup(app.store); });
 
 async function api(method, path, { token = T, body } = {}) {
   const res = await fetch(base + path, { method, headers: { 'content-type': 'application/json', ...(token ? { authorization: `Bearer ${token}` } : {}) }, body: body ? JSON.stringify(body) : undefined });
@@ -38,8 +38,8 @@ const ok = async (tool, args) => { const r = await propose(tool, args); assert.o
 // Runs a read tool exactly like the chat does and returns the plain-English answer.
 async function ask(tool, args) {
   const { TOOL_MAP, runReadTool } = await import('../server/tools.js');
-  const ctx = { db: app.db, ownerId: 1, ownerName: 'Carol', tz: 'Asia/Kolkata' };
-  return TOOL_MAP.get(tool).format(runReadTool(ctx, tool, args));
+  const ctx = { store: app.store, ownerId: 1, ownerName: 'Carol', tz: 'Asia/Kolkata' };
+  return TOOL_MAP.get(tool).format(await runReadTool(ctx, tool, args));
 }
 const room = (houseboat, guests, price, meal_plan, extra = {}) => ({ houseboat, guests, price, meal_plan, ...extra });
 const bookings = async () => (await api('GET', '/api/bookings')).data;
@@ -61,11 +61,12 @@ test('sender is compulsory: missing or "Not Provided" never reaches a card; "Dir
 });
 
 test('the database itself refuses a booking without a real sender (even if the app is bypassed)', async () => {
-  const ins = (sender) => app.db.prepare("INSERT INTO bookings(owner_id, client_name, sender, check_in, check_out) VALUES(1,'Raw',?,?,?)").run(sender, D(1), D(2));
-  for (const s of [null, '', '   ', 'Not Provided', 'n/a']) assert.throws(() => ins(s), /sender is required/, String(s));
-  assert.doesNotThrow(() => ins('Direct'));
-  assert.throws(() => app.db.prepare("UPDATE bookings SET sender = '' WHERE client_name = 'Raw'").run(), /sender is required/);
-  app.db.prepare("DELETE FROM bookings WHERE client_name = 'Raw'").run();
+  const bk = app.store.c('bookings');
+  const ins = (sender) => bk.insert({ owner_id: 1, client_name: 'Raw', sender, check_in: D(1), check_out: D(2), status: 'confirmed' });
+  for (const s of [null, '', '   ', 'Not Provided', 'n/a', 'UNKNOWN']) await assert.rejects(ins(s), /validation/i, String(s));
+  await ins('Direct');
+  await assert.rejects(bk.update({ client_name: 'Raw' }, { $set: { sender: '' } }), /validation/i);
+  await bk.remove({ client_name: 'Raw' });
 });
 
 test('optional details: skip guests / price / meal plan -> "details pending", then fill in later', async () => {
@@ -133,7 +134,7 @@ test('edit booking: change dates (clash refused, money follows), sender, client'
   assert.equal(after.nights, 1);
   assert.equal(after.billed, before / 2);
   // the freed night can now be booked by someone else
-  assert.equal(app.db.prepare('SELECT COUNT(*) c FROM room_night_locks WHERE booking_id = ?').get(mehta.id).c, 5);
+  assert.equal(await app.store.c('room_night_locks').count({ booking_id: mehta.id }), 5);
   // sender change, and an empty sender is refused
   await ok('update_booking', { booking_id: mehta.id, sender: 'Lake View Tours' });
   assert.equal((await bookings()).find((x) => x.id === mehta.id).sender, 'Lake View Tours');
@@ -153,7 +154,8 @@ test('move a room to another houseboat and remove a room: tokens, locks and what
   const moved = (await bookings()).find((x) => x.id === b.id).rooms.find((r) => r.token === 'CUL001');
   assert.equal(moved.houseboat, 'Cultural Palace');
   // CHI001 is free for that night again
-  assert.equal(app.db.prepare("SELECT COUNT(*) c FROM room_night_locks WHERE booking_id = ? AND stay_date = ? AND room_no = 1 AND houseboat_id = (SELECT id FROM houseboats WHERE name = 'Chinar')").get(b.id, D(20)).c, 0);
+  const chinar = await app.store.c('houseboats').one({ owner_id: 1, name_lc: 'chinar' });
+  assert.equal(await app.store.c('room_night_locks').count({ booking_id: b.id, stay_date: D(20), room_no: 1, houseboat_id: chinar.id }), 0);
   // moving to a houseboat that is own: nothing to pay for that room any more
   await ok('move_room', { booking_id: b.id, token: 'CUL001', to_houseboat: 'Sunrise' });
   assert.equal((await api('GET', '/api/balance')).data.houseboats.find((h) => h.name === 'Cultural Palace').pending, 0);
@@ -222,32 +224,6 @@ test('the bot is reminded of the sender rule and of last prices', async () => {
   assert.match(ai.lastSystem, /Chinar MAP ₹5,000/);
 });
 
-test('v3 database upgrades to v4: old bookings are kept (no sender), details become optional', async () => {
-  const fs = await import('node:fs'); const os = await import('node:os'); const path = await import('node:path');
-  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'bh4-')), 't.db');
-  const d = openDb(file);
-  // make it look like a v3 file
-  d.exec('PRAGMA foreign_keys = OFF; DROP TRIGGER bookings_sender_required_ins; DROP TRIGGER bookings_sender_required_upd; ALTER TABLE bookings DROP COLUMN sender; ALTER TABLE bookings DROP COLUMN rooms_required; DROP TABLE booking_rooms; ALTER TABLE owners DROP COLUMN session_version; ALTER TABLE owners DROP COLUMN role; ALTER TABLE owners DROP COLUMN plan; ALTER TABLE owners DROP COLUMN trial_ends_at; ALTER TABLE owners DROP COLUMN locked; ALTER TABLE owners DROP COLUMN gemini_key_enc; ALTER TABLE owners DROP COLUMN ai_calls; ALTER TABLE owners DROP COLUMN last_login_at; ALTER TABLE owners DROP COLUMN note;');
-  d.exec(`CREATE TABLE booking_rooms(id INTEGER PRIMARY KEY, booking_id INTEGER NOT NULL REFERENCES bookings(id), owner_id INTEGER NOT NULL, houseboat_id INTEGER NOT NULL REFERENCES houseboats(id), room_no INTEGER NOT NULL, token TEXT NOT NULL, guests INTEGER NOT NULL, meal_plan TEXT NOT NULL CHECK(meal_plan IN ('EP','CP','MAP','AP')), price INTEGER NOT NULL, cost INTEGER NOT NULL);`);
-  d.exec(`INSERT INTO owners(name,email,password_hash) VALUES('O','o@x.com','h'); INSERT INTO houseboats(owner_id,name,prefix) VALUES(1,'Old Boat','OLD');
-    INSERT INTO bookings(owner_id,client_name,check_in,check_out) VALUES(1,'Old Client','2026-12-01','2026-12-03');
-    INSERT INTO booking_rooms(booking_id,owner_id,houseboat_id,room_no,token,guests,meal_plan,price,cost) VALUES(1,1,1,1,'OLD001',2,'CP',3000,0);
-    PRAGMA user_version = 3;`);
-  d.close();
-  const d2 = openDb(file);
-  assert.equal(d2.prepare('SELECT client_name, sender FROM bookings').get().sender, null);
-  assert.equal(d2.prepare('SELECT guests, meal_plan, price FROM booking_rooms').get().price, 3000);
-  assert.equal(d2.prepare('PRAGMA user_version').get().user_version, 6);
-  assert.equal(d2.prepare('SELECT session_version FROM owners').get().session_version, 0, 'old owners get the new login-version column');
-  const oo = d2.prepare('SELECT role, plan, locked, trial_ends_at, gemini_key_enc FROM owners').get();
-  assert.deepEqual({ ...oo }, { role: 'owner', plan: 'full', locked: 0, trial_ends_at: null, gemini_key_enc: null }, 'old owners stay normal, never-expiring accounts after the v6 upgrade');
-  assert.equal(d2.prepare('PRAGMA table_info(booking_rooms)').all().find((c) => c.name === 'guests').notnull, 0);
-  d2.prepare("UPDATE bookings SET status = 'cancelled' WHERE id = 1").run(); // old rows without sender can still be cancelled
-  assert.throws(() => d2.prepare("INSERT INTO bookings(owner_id, client_name, check_in, check_out) VALUES(1,'New','2026-12-05','2026-12-06')").run(), /sender is required/);
-  assert.doesNotThrow(() => d2.prepare("INSERT INTO booking_rooms(booking_id,owner_id,houseboat_id,room_no,token,cost) VALUES(1,1,1,2,'OLD002',0)").run());
-  d2.close();
-});
-
 test('Gemini only receives standard schema keys (an unknown key makes it refuse the call)', async () => {
   const { toolDeclarations } = await import('../server/tools.js');
   const allowed = new Set(['type', 'description', 'enum', 'properties', 'required', 'items']);
@@ -277,8 +253,13 @@ test('when the AI call fails, the chat shows the real reason (not just "not reac
 test('"delete all" wipes every booking and money entry after confirmation; houseboats stay; other owners untouched', async () => {
   const r2 = await api('POST', '/api/auth/register', { token: null, body: { name: 'Dave', email: 'dave@x.com', password: 'password123' } });
   const D2 = r2.data.token;
-  app.db.exec("INSERT INTO houseboats(owner_id,name,prefix) VALUES(2,'Dave Boat','DAV'); INSERT INTO bookings(owner_id,client_name,sender,check_in,check_out) VALUES(2,'Dave Client','Direct','2030-01-01','2030-01-02'); INSERT INTO ledger(owner_id,booking_id,side,type,amount) VALUES(2,(SELECT MAX(id) FROM bookings),'CLIENT','CHARGE',500);");
-  const count = (t, o = 1) => app.db.prepare(`SELECT COUNT(*) c FROM ${t} WHERE owner_id = ?`).get(o).c;
+  const st = app.store;
+  await st.c('houseboats').insert({ owner_id: 2, name: 'Dave Boat', name_lc: 'dave boat', prefix: 'DAV', is_own: 0, total_rooms: null });
+  const daveB = await st.c('bookings').insert({ owner_id: 2, client_name: 'Dave Client', sender: 'Direct', check_in: '2030-01-01', check_out: '2030-01-02', status: 'confirmed' });
+  await st.c('ledger').insert({ owner_id: 2, booking_id: daveB.id, side: 'CLIENT', type: 'CHARGE', amount: 500 });
+  const counts = {}; const count = (t, o = 1) => counts[`${t}:${o}`];
+  const recount = async () => { for (const t of ['bookings', 'ledger', 'booking_rooms', 'room_night_locks', 'houseboats', 'messages']) for (const o of [1, 2]) counts[`${t}:${o}`] = await st.c(t).count({ owner_id: o }); };
+  await recount();
   assert.ok(count('bookings') > 3 && count('ledger') > 3);
   // typed phrase opens a confirm card straight away (no AI call is scripted)
   ai.queue.length = 0;
@@ -289,12 +270,14 @@ test('"delete all" wipes every booking and money entry after confirmation; house
   assert.equal(count('bookings') > 3, true, 'nothing deleted before confirming');
   // cancelling keeps everything
   assert.equal((await confirm(r.data.pending.token, false)).data.status, 'cancelled');
+  await recount();
   assert.ok(count('bookings') > 3);
   // Hinglish phrase and a typed "haan" confirm
   const again = await api('POST', '/api/chat', { body: { message: 'sab booking delete kar do' } });
   assert.equal(again.data.pending.tool, 'delete_all_bookings');
   const yes = await api('POST', '/api/chat', { body: { message: 'haan' } });
   assert.match(yes.data.reply, /were deleted/);
+  await recount();
   assert.equal(count('bookings'), 0);
   assert.equal(count('booking_rooms'), 0);
   assert.equal(count('room_night_locks'), 0);
@@ -312,7 +295,7 @@ test('"delete all" wipes every booking and money entry after confirmation; house
   // rooms are free again, and the ledger is still append-only for everyone else
   const fresh = await ok('create_booking', { client_name: 'Fresh Start', sender: 'Direct', check_in: D(20), check_out: D(21), rooms: [room('Chinar', 2, 1000, 'CP')] });
   assert.match(fresh.done.message, /CHI001/);
-  assert.throws(() => app.db.prepare('DELETE FROM ledger WHERE owner_id = 1').run(), /append-only/);
+  await assert.rejects(app.store.c('ledger').remove({ owner_id: 1 }), /append-only/);
   assert.equal(D2.length > 10, true);
 });
 
@@ -343,43 +326,43 @@ test('a houseboat has at most 5 rooms: a big request must be spread over several
 });
 
 test('delete one booking and delete a houseboat (chat tools and dashboard request), with confirmation', async () => {
-  const count = (t, o = 1) => app.db.prepare(`SELECT COUNT(*) c FROM ${t} WHERE owner_id = ?`).get(o).c;
+  const count = (t, o = 1) => app.store.c(t).count({ owner_id: o });
   await ok('create_booking', { client_name: 'Keep Me', sender: 'Direct', check_in: D(40), check_out: D(41), rooms: [room('Chinar', 2, 1000, 'CP')] });
   const made = await ok('create_booking', { client_name: 'Delete Me', sender: 'Direct', check_in: D(40), check_out: D(42), advance: 500, rooms: [room('Chinar', 2, 2000, 'CP')] });
   const id = Number(/#(\d+)/.exec(made.done.message)[1]);
   await ok('record_client_payment', { booking_id: id, amount: 300, method: 'UPI' });
-  const before = { b: count('bookings'), l: count('ledger') };
+  const before = { b: await count('bookings'), l: await count('ledger') };
 
   // the dashboard button builds the card; nothing is deleted until it is approved
   const card = await api('POST', '/api/delete-request', { body: { kind: 'booking', id } });
   assert.equal(card.status, 200);
   assert.equal(card.data.tool, 'delete_booking');
   assert.match(card.data.preview.lines.join(' '), /deleted for good/);
-  assert.equal(count('bookings'), before.b);
+  assert.equal(await count('bookings'), before.b);
   assert.equal((await confirm(card.data.token, false)).data.status, 'cancelled');
-  assert.equal(count('bookings'), before.b);
+  assert.equal(await count('bookings'), before.b);
 
   // approve: only that booking, its rooms, locks and money go; the other booking stays
   const again = await api('POST', '/api/delete-request', { body: { kind: 'booking', id } });
   const done = await confirm(again.data.token);
   assert.equal(done.data.status, 'confirmed');
   assert.match(done.data.message, /deleted/);
-  assert.equal(count('bookings'), before.b - 1);
-  assert.ok(count('ledger') < before.l);
-  assert.equal(app.db.prepare('SELECT COUNT(*) c FROM ledger WHERE booking_id = ?').get(id).c, 0);
-  assert.equal(app.db.prepare('SELECT COUNT(*) c FROM booking_rooms WHERE booking_id = ?').get(id).c, 0);
-  assert.equal(app.db.prepare('SELECT COUNT(*) c FROM room_night_locks WHERE booking_id = ?').get(id).c, 0);
+  assert.equal(await count('bookings'), before.b - 1);
+  assert.ok(await count('ledger') < before.l);
+  assert.equal(await app.store.c('ledger').count({ booking_id: id }), 0);
+  assert.equal(await app.store.c('booking_rooms').count({ booking_id: id }), 0);
+  assert.equal(await app.store.c('room_night_locks').count({ booking_id: id }), 0);
   assert.equal((await api('POST', '/api/delete-request', { body: { kind: 'booking', id } })).status, 400, 'already gone');
   // the ledger stays append-only otherwise
-  assert.throws(() => app.db.prepare('DELETE FROM ledger WHERE owner_id = 1').run(), /append-only/);
+  await assert.rejects(app.store.c('ledger').remove({ owner_id: 1 }), /append-only/);
 
   // another owner cannot delete my booking
   const r2 = await api('POST', '/api/auth/login', { token: null, body: { email: 'dave@x.com', password: 'password123' } });
-  const keep = app.db.prepare("SELECT id FROM bookings WHERE client_name = 'Keep Me'").get().id;
+  const keep = (await app.store.c('bookings').one({ client_name: 'Keep Me' })).id;
   assert.equal((await api('POST', '/api/delete-request', { token: r2.data.token, body: { kind: 'booking', id: keep } })).status, 400);
 
   // houseboat: refused while it has bookings, allowed when it has none
-  const used = await api('POST', '/api/delete-request', { body: { kind: 'houseboat', id: app.db.prepare("SELECT id FROM houseboats WHERE owner_id = 1 AND name = 'Chinar'").get().id } });
+  const used = await api('POST', '/api/delete-request', { body: { kind: 'houseboat', id: (await app.store.c('houseboats').one({ owner_id: 1, name_lc: 'chinar' })).id } });
   assert.equal(used.status, 400);
   assert.match(used.data.error, /cannot be deleted/);
   await api('POST', '/api/houseboats', { body: { name: 'Test Boat', total_rooms: 3 } });
@@ -388,7 +371,7 @@ test('delete one booking and delete a houseboat (chat tools and dashboard reques
   assert.equal(viaChat.data.pending.tool, 'delete_houseboat');
   const gone = await confirm(viaChat.data.pending.token);
   assert.match(gone.data.message, /Test Boat was deleted/);
-  assert.equal(app.db.prepare("SELECT COUNT(*) c FROM houseboats WHERE owner_id = 1 AND name = 'Test Boat'").get().c, 0);
+  assert.equal(await app.store.c('houseboats').count({ owner_id: 1, name_lc: 'test boat' }), 0);
   // deleting from the dashboard works too, and the name can be added again
   const hb = (await api('POST', '/api/houseboats', { body: { name: 'Test Boat', total_rooms: 3 } })).data;
   const dc = await api('POST', '/api/delete-request', { body: { kind: 'houseboat', id: hb.id } });
@@ -396,11 +379,11 @@ test('delete one booking and delete a houseboat (chat tools and dashboard reques
 });
 
 test('set_meal_plans changes many houseboats in one confirmation (CPI/API aliases, by date)', async () => {
-  const plan = (n) => app.db.prepare("SELECT meal_plan FROM booking_rooms WHERE token = ?").all(n).map((r) => r.meal_plan);
+  const plan = async (n) => (await app.store.c('booking_rooms').find({ token: n })).map((r) => r.meal_plan);
   const a = await ok('create_booking', { client_name: 'Meal One', sender: 'Direct', check_in: D(200), check_out: D(202), rooms: [room('Flower Garden', 2, 3000, 'MAP'), room('Flower Garden', 2, 3000, 'MAP'), room('Chinar', 2, 4000, 'EP'), room('Helen of Troy', 2, 5000, 'CP')] });
   const b = await ok('create_booking', { client_name: 'Meal Two', sender: 'Direct', check_in: D(201), check_out: D(203), rooms: [room('Helen of Troy', 3, 5000, 'EP'), room('Chinar', 2, 4000, 'AP')] });
   assert.ok(a.done && b.done);
-  const flRooms = app.db.prepare("SELECT token FROM booking_rooms WHERE token LIKE 'FLO%'").all();
+  const flRooms = await app.store.c('booking_rooms').find({ token: /^FLO/ });
   assert.equal(flRooms.length, 2);
   // owner says plans for three houseboats on one night (D(201): both bookings are staying)
   const r = await propose('set_meal_plans', { date: D(201), changes: [{ houseboat: 'Flower Garden', meal_plan: 'EP' }, { houseboat: 'Chinar', meal_plan: 'CPI' }, { houseboat: 'Helen of Troy', meal_plan: 'API' }] });
@@ -409,11 +392,16 @@ test('set_meal_plans changes many houseboats in one confirmation (CPI/API aliase
   assert.match(lines, /Flower Garden -> EP/);
   assert.match(lines, /Chinar -> CP/);
   assert.match(lines, /Helen of Troy -> AP/);
-  assert.equal(plan(flRooms[0].token)[0], 'MAP', 'nothing changes before confirming');
+  assert.equal((await plan(flRooms[0].token))[0], 'MAP', 'nothing changes before confirming');
   const done = await confirm(r.pending.token);
   assert.equal(done.data.status, 'confirmed', done.data.message);
   assert.match(done.data.message, /Meal plan changed for 6 rooms/);
-  const all = app.db.prepare("SELECT h.name n, br.meal_plan p FROM booking_rooms br JOIN houseboats h ON h.id = br.houseboat_id JOIN bookings b ON b.id = br.booking_id WHERE b.client_name LIKE 'Meal %'").all();
+  const mealRooms = async (client, tokenStart = '') => {
+    const ids = (await app.store.c('bookings').find({ client_name: client })).map((b) => b.id);
+    const boats = new Map((await app.store.c('houseboats').find({ owner_id: 1 })).map((h) => [h.id, h.name]));
+    return (await app.store.c('booking_rooms').find({ booking_id: { $in: ids } })).filter((r) => r.token.startsWith(tokenStart)).map((r) => ({ n: boats.get(r.houseboat_id), p: r.meal_plan }));
+  };
+  const all = [...await mealRooms('Meal One'), ...await mealRooms('Meal Two')];
   for (const x of all) assert.equal(x.p, { 'Flower Garden': 'EP', Chinar: 'CP', 'Helen of Troy': 'AP' }[x.n], x.n);
   // money is untouched by a meal-plan change, and a repeat reports nothing to change
   ai.queue.push(call('set_meal_plans', { date: D(201), changes: [{ houseboat: 'Chinar', meal_plan: 'CP' }] }));
@@ -421,14 +409,14 @@ test('set_meal_plans changes many houseboats in one confirmation (CPI/API aliase
   const same = await api('POST', '/api/chat', { body: { message: 'Chinar CP on that day' } });
   assert.equal(same.data.pending, null);
   // an unknown houseboat is mentioned in the card but the known one still changes; one booking only
-  const oneId = app.db.prepare("SELECT id FROM bookings WHERE client_name = 'Meal One'").get().id;
+  const oneId = (await app.store.c('bookings').one({ client_name: 'Meal One' })).id;
   const part = await propose('set_meal_plans', { booking_id: oneId, meal_plan: 'MAP' });
   assert.equal(part.pending.tool, 'set_meal_plans');
   await confirm(part.pending.token, false);
   const mix = await propose('set_meal_plans', { date: D(200), changes: [{ houseboat: 'Chinar', meal_plan: 'MAP' }, { houseboat: 'Nowhere Boat', meal_plan: 'EP' }] });
   assert.match(mix.pending.preview.lines.join(' '), /Nowhere Boat/);
   assert.equal((await confirm(mix.pending.token)).data.status, 'confirmed');
-  assert.equal(app.db.prepare("SELECT br.meal_plan p FROM booking_rooms br JOIN bookings b ON b.id = br.booking_id WHERE b.client_name = 'Meal One' AND br.token LIKE 'CHI%'").get().p, 'MAP');
+  assert.equal((await mealRooms('Meal One', 'CHI'))[0].p, 'MAP');
   // needs a date or booking
   ai.queue.push(call('set_meal_plans', { changes: [{ houseboat: 'Chinar', meal_plan: 'CP' }] }));
   ai.queue.push(say('Which date?'));
