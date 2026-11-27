@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="BoatHouse">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icons/icon-180.png">
+  <meta name="theme-color" content="#0a2f36">
+  <title>BoatHouse AI</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230f766e'/%3E%3Cpath d='M6 19h20l-3 5H9z M16 7l7 9H9z' fill='white'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/theme.js"></script>
+  <script src="/config.js"></script>
+</head>
+<body>
+  <!-- Login (accounts are created by the BoatHouse admin; there is no sign-up) -->
+  <main id="auth" class="auth" hidden>
+    <section class="auth-hero" aria-hidden="true">
+      <div class="brand"><span class="logo"></span><span>BoatHouse AI</span></div>
+      <h2>Your houseboats, run by chat.</h2>
+      <div class="demo">
+        <div class="demo-msg me">2 Dec, 8 rooms. 4 mine, 2 Chinar, 2 Cultural Palace</div>
+        <div class="demo-msg bot">Who is the client, and who sent this booking?</div>
+        <div class="demo-msg me">Sharma family, sender Blue Lake Agency</div>
+      </div>
+      <svg class="waves" viewBox="0 0 800 120" preserveAspectRatio="none"><path class="w1" d="M0 60 Q100 20 200 60 T400 60 T600 60 T800 60 V120 H0Z"/><path class="w2" d="M0 80 Q100 45 200 80 T400 80 T600 80 T800 80 V120 H0Z"/></svg>
+    </section>
+    <form id="auth-form" class="auth-card" autocomplete="on">
+      <div class="brand"><span class="logo" aria-hidden="true"></span><span>BoatHouse AI</span></div>
+      <div class="auth-head">
+        <h1>Welcome back</h1>
+        <p class="auth-sub">Log in to see your bookings and talk to your assistant.</p>
+      </div>
+      <p id="auth-notice" class="notice" role="status" hidden></p>
+      <label>Email<input id="f-email" name="email" type="email" autocomplete="username" inputmode="email" autocapitalize="none" spellcheck="false" required></label>
+      <label>Password
+        <span class="pw"><input id="f-pass" name="password" type="password" autocomplete="current-password" minlength="8" required><button type="button" class="pw-toggle" id="pw-toggle" aria-label="Show password" aria-pressed="false">Show</button></span>
+      </label>
+      <p id="auth-error" class="error" role="alert" hidden></p>
+      <button class="primary" id="auth-submit" type="submit">Log in</button>
+      <button class="ghost" id="install-login" type="button" hidden>Install the app</button>
+      <p class="auth-foot">Accounts are made by your BoatHouse admin. If you forgot your password, ask them to reset it.</p>
+    </form>
+  </main>
+
+  <!-- Main app: dashboard on the LEFT, the one chat on the RIGHT -->
+  <div id="app" class="app" hidden>
+    <header class="topbar">
+      <div class="brand"><span class="logo" aria-hidden="true"></span><span>BoatHouse AI</span></div>
+      <div class="top-right">
+        <button id="theme-btn" class="theme-toggle" type="button" aria-label="Switch to dark mode" title="Switch to dark mode">
+          <svg class="i-moon" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M20.4 14.6A8.5 8.5 0 0 1 9.4 3.6a.7.7 0 0 0-.9-.9A10 10 0 1 0 21.3 15.5a.7.7 0 0 0-.9-.9z"/></svg>
+          <svg class="i-sun" viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><circle cx="12" cy="12" r="4.2" fill="currentColor"/><path stroke="currentColor" stroke-width="2" stroke-linecap="round" d="M12 2.5v2.2M12 19.3v2.2M2.5 12h2.2M19.3 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M5.3 18.7l1.6-1.6M17.1 6.9l1.6-1.6"/></svg>
+        </button>
+        <button id="account-btn" class="account-btn" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="account-menu">
+          <span class="avatar" id="avatar" aria-hidden="true">B</span><span id="owner-name" class="who"></span>
+          <svg class="chev" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M7 10l5 5 5-5z"/></svg>
+        </button>
+        <div id="account-menu" class="menu" role="menu" hidden>
+          <div class="menu-head"><strong id="menu-name"></strong><span id="menu-email"></span><span id="menu-trial" class="menu-trial" hidden></span></div>
+          <button id="menu-install" role="menuitem" type="button" hidden>Install the app</button>
+          <button id="menu-password" role="menuitem" type="button">Change password</button>
+          <button id="clear-chat" role="menuitem" type="button" title="Clear the chat messages (bookings stay safe)">Clear chat</button>
+          <button id="logout" class="danger" role="menuitem" type="button">Log out</button>
+        </div>
+      </div>
+    </header>
+
+    <div class="cols">
+      <aside id="panel" class="panel" aria-label="Dashboard">
+        <div id="tabs" class="tabs" role="tablist"></div>
+        <div id="panel-body" class="panel-body"></div>
+      </aside>
+
+      <section id="chat" class="chat" aria-label="Chat">
+        <div class="chat-head">
+          <h1>Assistant</h1>
+          <span id="mode-badge" class="badge" hidden>Simple mode</span>
+        </div>
+        <div id="messages" class="messages" aria-live="polite"></div>
+        <div class="composer-wrap">
+          <div id="chips" class="chips"></div>
+          <form id="composer" class="composer">
+            <textarea id="input" rows="1" placeholder="Type or speak..." aria-label="Message"></textarea>
+            <button id="mic-btn" class="icon-btn mic" type="button" aria-label="Speak" title="Speak">
+              <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V22h2v-3.08A7 7 0 0 0 19 12h-2z"/></svg>
+            </button>
+            <button id="send-btn" class="send" type="submit" aria-label="Send">
+              <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M3 20.5v-6.9l9-1.6-9-1.6V3.5L22 12z"/></svg>
+            </button>
+          </form>
+          <div class="opts">
+            <label><input type="checkbox" id="opt-autosend"> <span class="lg">Send automatically when I turn the mic off</span><span class="sm">Auto-send</span></label>
+            <label><input type="checkbox" id="opt-speak"> <span class="lg">Read replies aloud</span><span class="sm">Read aloud</span></label>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <!-- Admin dashboard: only the BoatHouse admin sees this instead of the dashboard + chat -->
+    <section id="admin-view" class="admin-view" aria-label="Admin dashboard" hidden></section>
+
+    <nav class="bottom-tabs" aria-label="Switch view">
+      <button id="bt-dash" type="button" aria-pressed="false"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M3 3h8v10H3zm10 0h8v6h-8zM3 15h8v6H3zm10-4h8v10h-8z"/></svg><span>Dashboard</span></button>
+      <button id="bt-chat" type="button" aria-pressed="true"><svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M4 4h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-5 4v-4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/></svg><span>Chat</span></button>
+    </nav>
+  </div>
+
+  <!-- Review popup (booking details, or any change that needs a yes) -->
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div id="modal-body" class="modal-body"></div>
+      <div id="modal-actions" class="modal-actions"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status" hidden></div>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

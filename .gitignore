@@ -1,0 +1,28 @@
+# dependencies
+node_modules/
+
+# secrets: never commit these
+.env
+.env.*
+!.env.example
+.secret
+*.pem
+*.key
+
+# the database, its backups and the generated login secret
+data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+backups/
+boathouse-*.json
+
+# local junk
+*.log
+npm-debug.log*
+.DS_Store
+Thumbs.db
+*.zip
+.vscode/
+.idea/

@@ -1,0 +1,20 @@
+{
+  "name": "boathouse-ai",
+  "version": "0.5.0",
+  "private": true,
+  "description": "Chat-first BoatHouse management dashboard. Owners talk (English / Hindi / Hinglish) and the bot edits and reads their own dashboard.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --no-warnings server/index.js",
+    "dev": "node --no-warnings --watch server/index.js",
+    "seed": "node --no-warnings server/seed.js",
+    "add-owner": "node --no-warnings server/add-owner.js",
+    "reset-password": "node --no-warnings server/reset-password.js",
+    "check-ai": "node --no-warnings server/check-ai.js",
+    "test": "node --no-warnings --test test/api.test.js test/v4.test.js test/v6.test.js test/translit.test.js test/security.test.js",
+    "add-admin": "node --no-warnings server/add-admin.js"
+  }
+}
