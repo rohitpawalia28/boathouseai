@@ -31,6 +31,8 @@ export function getConfig(overrides = {}) {
     adminEmail: (env.ADMIN_EMAIL || '').trim().toLowerCase(),
     adminPassword: env.ADMIN_PASSWORD || '',
     adminName: (env.ADMIN_NAME || 'Admin').trim(),
+    // The chat clears itself this many seconds after the last message (0 = never). A waiting confirm card is never cleared.
+    chatCleanSeconds: env.CHAT_CLEAN_SECONDS === undefined || env.CHAT_CLEAN_SECONDS === '' ? 60 : Math.max(0, Number(env.CHAT_CLEAN_SECONDS) || 0),
     contactInfo: (env.CONTACT_INFO || '').trim(), // shown to customers whose trial ended, e.g. "WhatsApp 98xxxxxx"
     corsOrigins: (env.CORS_ORIGIN || '').split(',').map((s) => s.trim()).filter(Boolean),
     tz: env.APP_TZ || 'Asia/Kolkata',

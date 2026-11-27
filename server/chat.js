@@ -268,8 +268,24 @@ export async function mainConversation(ctx) {
   return (await col(ctx, 'conversations').insert({ owner_id: ctx.ownerId, title: 'Chat', updated_at: nowIso() })).id;
 }
 
+// Old chat clears itself: once the last message is older than ctx.chatCleanSeconds, the messages are deleted
+// (bookings and money are never touched). Not while a confirm card is still waiting, so a booking under review never vanishes.
+export async function autoClean(ctx, conv) {
+  const secs = ctx.chatCleanSeconds;
+  if (!secs) return false;
+  const last = await col(ctx, 'messages').one({ conversation_id: conv, owner_id: ctx.ownerId }, { sort: { id: -1 } });
+  if (!last) return false;
+  const now = ctx.now ? ctx.now() : Date.now();
+  if (now - Date.parse(last.created_at) < secs * 1000) return false;
+  const waiting = await col(ctx, 'pending_actions').one({ owner_id: ctx.ownerId, conversation_id: conv, status: { $in: ['pending', 'saving'] }, expires_at: { $gt: new Date(now).toISOString() } });
+  if (waiting) return false;
+  await col(ctx, 'messages').remove({ conversation_id: conv, owner_id: ctx.ownerId });
+  return true;
+}
+
 export async function loadHistory(ctx, limit = 80) {
   const conv = await mainConversation(ctx);
+  await autoClean(ctx, conv);
   const msgs = (await col(ctx, 'messages').find({ conversation_id: conv, owner_id: ctx.ownerId }, { sort: { id: -1 }, limit })).reverse();
   const tokens = msgs.map((m) => (m.meta ? JSON.parse(m.meta) : null)?.pending?.token).filter(Boolean);
   const pend = new Map((tokens.length ? await col(ctx, 'pending_actions').find({ owner_id: ctx.ownerId, _id: { $in: tokens } }) : []).map((r) => [r.token, r]));
@@ -296,6 +312,7 @@ export async function handleChat(ctx, provider, rawText) {
   const text = String(rawText || '').trim().slice(0, MAX_MESSAGE);
   if (!text) throw new ToolError('Please type or say something.');
   const conversationId = await mainConversation(ctx);
+  await autoClean(ctx, conversationId); // an old, finished chat does not confuse the AI
   await saveMessage(ctx, conversationId, 'user', text);
 
   const pendingRow = await getPending(ctx, conversationId);

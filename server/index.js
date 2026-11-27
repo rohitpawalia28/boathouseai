@@ -55,7 +55,7 @@ export async function createApp(overrides = {}) {
 
   // A new account with every field set (MongoDB has no column defaults).
   const newOwner = (o) => owners.insert(ownerDoc(o));
-  const ctxFor = (owner) => ({ store, ownerId: owner.id, ownerName: owner.name, tz: cfg.tz });
+  const ctxFor = (owner) => ({ store, ownerId: owner.id, ownerName: owner.name, tz: cfg.tz, chatCleanSeconds: overrides.chatCleanSeconds ?? cfg.chatCleanSeconds, now: nowMs });
   const tokenFor = (o) => signToken({ sub: o.id, sv: o.session_version ?? 0 }, cfg.secret);
   /* ---------------- trial lock, admin and each customer's own AI key ---------------- */
   const nowMs = () => (overrides.now ? overrides.now() : Date.now()); // tests can move the clock
@@ -147,7 +147,7 @@ export async function createApp(overrides = {}) {
     return { ok: true, token: tokenFor(fresh) };
   }, { role: 'any' });
 
-  route('GET', '/api/me', ({ owner }) => ({ id: owner.id, name: owner.name, email: owner.email, role: owner.role, ai: owner.role === 'owner' && Boolean(rawProviderFor(owner)), trial: owner.access.trial || null }), { role: 'any' });
+  route('GET', '/api/me', ({ owner }) => ({ id: owner.id, name: owner.name, email: owner.email, role: owner.role, ai: owner.role === 'owner' && Boolean(rawProviderFor(owner)), trial: owner.access.trial || null, chat_clean_seconds: overrides.chatCleanSeconds ?? cfg.chatCleanSeconds }), { role: 'any' });
 
   /* ---------------- dashboard (read-only; all changes happen through chat) ---------------- */
   route('GET', '/api/dashboard', ({ ctx }) => dashboardSummary(ctx));

@@ -304,3 +304,36 @@ test('ADMIN_EMAIL + ADMIN_PASSWORD in .env create the admin on start, once, and 
   assert.equal((await st.c('owners').one({ email: 'boss@mail.com' })).password_hash, hash);
   await cleanup(st);
 });
+
+test('the chat clears itself 1 minute after the last message, never while a confirm card waits; bookings stay', async () => {
+  let now = Date.now();
+  const st = await openStore(TEST_URI, storeOpts());
+  await st.c('owners').insert(ownerDoc({ name: 'Chatty', email: 'chat@x.com', password_hash: await hashPassword('password123') }));
+  const call = (name, args) => ({ parts: [{ functionCall: { name, args } }], functionCalls: [{ name, args }], text: '' });
+  const q = []; const ai = { name: 'q', async generate() { return q.shift() || say('ok'); } };
+  const a = await createApp({ store: st, secret: 's', provider: ai, now: () => now });
+  await new Promise((r) => a.server.listen(0, r));
+  const base2 = `http://localhost:${a.server.address().port}`;
+  const call2 = async (m, p, body, t) => (await fetch(base2 + p, { method: m, headers: { 'content-type': 'application/json', ...(t ? { authorization: `Bearer ${t}` } : {}) }, body: body ? JSON.stringify(body) : undefined })).json();
+  const t = (await call2('POST', '/api/auth/login', { email: 'chat@x.com', password: 'password123' })).token;
+  assert.equal((await call2('GET', '/api/me', null, t)).chat_clean_seconds, 60);
+  const age = async (secs) => { const old = new Date(now - secs * 1000).toISOString(); await st.c('messages').updateMany({ owner_id: { $gt: 0 } }, { $set: { created_at: old } }); };
+  await call2('POST', '/api/chat', { message: 'hello' }, t);
+  assert.equal((await call2('GET', '/api/history', null, t)).messages.length, 2);
+  await age(30); // half a minute old: still there
+  assert.equal((await call2('GET', '/api/history', null, t)).messages.length, 2);
+  await age(61); // over a minute old: cleared
+  assert.equal((await call2('GET', '/api/history', null, t)).messages.length, 0);
+  // a booking card is waiting: the chat is NOT cleared even when old
+  q.push(call('create_booking', { client_name: 'Wait Me', sender: 'Direct', check_in: '2030-01-01', check_out: '2030-01-02', rooms: [{ houseboat: 'Lake', price: 1000, shikara: false }] }));
+  const card = (await call2('POST', '/api/chat', { message: 'book' }, t)).pending;
+  await age(300);
+  assert.equal((await call2('GET', '/api/history', null, t)).messages.length, 2, 'kept while the card waits');
+  // confirm it, then a minute later the chat clears but the booking stays
+  await call2('POST', '/api/confirm', { token: card.token }, t);
+  await age(61);
+  assert.equal((await call2('GET', '/api/history', null, t)).messages.length, 0);
+  assert.equal((await call2('GET', '/api/bookings', null, t)).length, 1, 'bookings are never touched');
+  a.server.close();
+  await cleanup(st);
+});

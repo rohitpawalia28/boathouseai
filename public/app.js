@@ -358,6 +358,23 @@ function addMessage({ role, content, meta }) {
   if (meta?.pending) bubble.append(confirmCard(meta.pending));
   messagesBox().append(h('div', { class: `msg ${role}` }, bubble));
   scrollDown();
+  scheduleClean();
+}
+
+// Old chat clears itself a minute after the last message (the server does the same).
+// It waits while a confirm card is open, a reply is coming, the mic is on or a popup is open.
+let cleanTimer = null;
+function scheduleClean() {
+  clearTimeout(cleanTimer);
+  const secs = me?.chat_clean_seconds;
+  if (!secs) return;
+  cleanTimer = setTimeout(autoCleanChat, secs * 1000 + 1500); // a little after the server's minute
+}
+async function autoCleanChat() {
+  const waiting = document.querySelector('.confirm:not(.done)') || busy || holdSend || !$('modal').hidden || (typeof wantListening !== 'undefined' && wantListening);
+  if (waiting) return scheduleClean(); // try again later
+  if (!document.querySelector('#messages .msg')) return;
+  try { await api('GET', '/api/history').then(({ messages }) => { if (!messages.length) showHello(); }); } catch { /* next time */ }
 }
 function scrollDown() { const m = $('messages'); m.scrollTop = m.scrollHeight; }
 
