@@ -84,6 +84,8 @@ CHANGING A SAVED BOOKING (each needs the owner's confirmation):
 - To add houseboats ("add Chinar, Blue Sky (mine), Purple Sky"), call add_houseboats ONCE with every houseboat named. Never tell the owner to use a button instead. If the room count of a new houseboat is not given, ask for it in the same message as your other questions (he can say skip). A booking may also use a new houseboat name directly: create_booking adds it.
 - delete_all_bookings wipes EVERY booking and money entry. Use it only when the owner clearly says to delete or clear all bookings / everything. To remove ONE booking completely (wrong or test booking: "delete booking 3", "booking 3 hata do") use delete_booking; to only cancel it and keep its record use cancel_booking. To remove a houseboat name ("delete Chinar", "Chinar hata do") use delete_houseboat; it works only if that houseboat has no bookings, otherwise explain that the bookings must be deleted or moved first. Ask which one if the owner just says "delete" without saying what.
 - SHIKARA RIDE: every room has its own shikara ride setting: included (with a price) or not included. Pass shikara (true/false) and shikara_price per room in create_booking / add_rooms. The price is charged ONCE per room, not per night, and is added to the client total. If the owner says it is included but gives no price, ask "What is the shikara ride price per room?" before or right after saving (pass shikara true without shikara_price; it shows as price pending). If he did not say anything, leave it out: it shows as "shikara pending". For many rooms at once ("all rooms shikara included, 500 each", "no shikara for Chinar rooms") use set_shikara; for one room use update_room.
+- MANY ROOM CHANGES IN ONE MESSAGE: only ONE change card can be shown per message, so when the owner changes more than one room (different shikara prices per room, prices, guests, meal plans, on one or several houseboats) call update_rooms ONCE with an item for EVERY room he mentioned. Never change only the first room and drop the rest. "Pehle / dusre / teesre wale" (first / second / third) room of a houseboat = its tokens in order (PIN001, PIN002, PIN003). If you do not know the tokens, call list_bookings first, then update_rooms. Example: "Pink ke teen shikara: pehle 600, dusre 800, teesre 700" -> update_rooms changes [{token PIN001, shikara true, shikara_price 600}, {token PIN002, shikara true, shikara_price 800}, {token PIN003, shikara true, shikara_price 700}].
+- If one message asks for two different kinds of change (for example rooms AND a payment), make the first change now and tell the owner you will do the second right after he confirms.
 - update_room: guests, meal plan, price or shikara ride of ONE room, or filling in details that were skipped. set_meal_plans: meal plans of MANY rooms in ONE call. When the owner names meal plans for several houseboats ("on 28 December Flower Garden EP, Chinar CPI, Helen of Troy API") or says one plan for all rooms of a date or booking, call set_meal_plans ONCE with a "changes" item for EVERY houseboat he named; never use update_room for just the first one and forget the rest. update_booking: dates, sender, client name, phone, rooms_required. add_rooms: more rooms. remove_room: take one room out. move_room: shift a room to another houseboat. cancel_booking: cancel everything.
 
 ANSWERING QUESTIONS (always call a tool, never guess):
@@ -218,6 +220,31 @@ function askOwnerText(message, fc) {
   return `${known.length ? `Got it (${known.join(', ')}). ` : ''}${message}\nYou can also add the guests in each room, the shikara ride (included or not, and its price) and the client's phone number, or say "skip".`;
 }
 
+// The AI sometimes answers with several room calls at once (update_room x3, set_shikara + update_room...).
+// Only one card fits a message, so those are joined into ONE update_rooms call and nothing is lost.
+const ROOM_CALLS = new Set(['update_room', 'update_rooms', 'set_shikara']);
+function mergeRoomCalls(calls) {
+  const room = calls.filter((c) => ROOM_CALLS.has(c.name));
+  if (room.length < 2) return calls;
+  const changes = [];
+  for (const c of room) {
+    const a = c.args || {};
+    if (c.name === 'update_room') {
+      const { booking_id, token, guests, meal_plan, price, partner_price, shikara, shikara_price } = a;
+      changes.push({ booking_id, token, guests, meal_plan, price, partner_price, shikara, shikara_price });
+    } else if (c.name === 'set_shikara') {
+      changes.push({ booking_id: a.booking_id, tokens: a.tokens, houseboat: a.houseboat, shikara: a.included, shikara_price: a.price });
+    } else for (const ch of a.changes || []) changes.push({ booking_id: a.booking_id, ...ch });
+  }
+  const merged = { name: 'update_rooms', args: { changes: changes.map((x) => Object.fromEntries(Object.entries(x).filter(([, v]) => v !== undefined))) } };
+  const out = []; let done = false;
+  for (const c of calls) {
+    if (!ROOM_CALLS.has(c.name)) out.push(c);
+    else if (!done) { out.push(merged); done = true; }
+  }
+  return out;
+}
+
 async function aiTurn(ctx, provider, conversationId, pendingRow) {
   const contents = await historyFor(ctx, conversationId);
   const system = await systemPrompt(ctx, pendingRow);
@@ -227,15 +254,16 @@ async function aiTurn(ctx, provider, conversationId, pendingRow) {
     const out = await provider.generate({ system, contents, tools });
     if (!out.functionCalls.length) return { text: out.text || 'Sorry, I did not get that. Could you say it again?' };
     contents.push({ role: 'model', parts: out.parts });
+    const calls = mergeRoomCalls(out.functionCalls);
     const responses = [];
     let card = null;
-    for (const fc of out.functionCalls) {
+    for (const fc of calls) {
       let response;
       try {
         const tool = TOOL_MAP.get(fc.name);
         if (!tool) throw new ToolError(`Unknown tool ${fc.name}.`);
         if (!tool.write) response = { result: await runReadTool(ctx, fc.name, fc.args) };
-        else if (card) response = { error: 'Only one change can be proposed per message.' };
+        else if (card) response = { error: 'Only one change card can be shown per message. Room changes must all go in ONE update_rooms call. Tell the owner this other change will be done right after he confirms the first one.' };
         else {
           const prep = await prepareWriteTool(ctx, fc.name, fc.args);
           card = await createPending(ctx, conversationId, fc.name, prep.args, prep.summary, prep.preview);

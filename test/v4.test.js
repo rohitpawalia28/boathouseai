@@ -570,3 +570,50 @@ test('shikara ride per room: pending (?) until told, yes with a price (charged o
   await ok('cancel_booking', { booking_id: b.id });
   assert.equal((await bookings()).find((x) => x.id === b.id).balance, 0);
 });
+
+test('many room changes in one message: one update_rooms card, each room its own values, across houseboats', async () => {
+  const mk = await ok('create_booking', { client_name: 'Multi Room', sender: 'Direct', check_in: D(320), check_out: D(322),
+    rooms: [room('Blue Bay', 2, 5000, 'CP', { shikara: undefined }), room('Blue Bay', 2, 5000, 'CP', { shikara: undefined }), room('Pink Lotus', 2, 4000, 'CP', { shikara: undefined }), room('Pink Lotus', 2, 4000, 'CP', { shikara: undefined }), room('Pink Lotus', 2, 4000, 'CP', { shikara: undefined })] });
+  const id = Number(/#(\d+)/.exec(mk.done.message)[1]);
+  // "Pink ke teen shikara: pehle 600, dusre 800, teesre 700; Blue dono 500; PIN002 MAP"
+  const r = await propose('update_rooms', { booking_id: id, changes: [
+    { token: 'PIN001', shikara: true, shikara_price: 600 }, { token: 'pin002', shikara: true, shikara_price: 800, meal_plan: 'MAPI' }, { token: 'PIN003', shikara_price: 700 },
+    { houseboat: 'Blue Bay', shikara: true, shikara_price: 500 },
+  ] });
+  assert.equal(r.pending.tool, 'update_rooms');
+  const lns = r.pending.preview.lines.join('\n');
+  assert.match(lns, /PIN001 \(Pink Lotus\): shikara pending -> ✓ ₹600/);
+  assert.match(lns, /PIN002 \(Pink Lotus\): meal CP -> MAP; shikara pending -> ✓ ₹800/);
+  assert.match(lns, /PIN003.*✓ ₹700/);
+  assert.match(lns, /BLU001.*✓ ₹500/); assert.match(lns, /BLU002.*✓ ₹500/);
+  assert.match(lns, /Client total \+₹3,100/);
+  assert.equal((await confirm(r.pending.token)).data.status, 'confirmed');
+  const b = (await bookings()).find((x) => x.id === id);
+  const by = Object.fromEntries(b.rooms.map((x) => [x.token, x]));
+  assert.deepEqual([by.PIN001.shikara_price, by.PIN002.shikara_price, by.PIN003.shikara_price, by.BLU001.shikara_price, by.BLU002.shikara_price], [600, 800, 700, 500, 500]);
+  assert.equal(by.PIN002.meal_plan, 'MAP');
+  assert.deepEqual(b.pending_tokens, []);
+  assert.equal(b.billed, (2 * 5000 + 3 * 4000) * 2 + 3100);
+  // prices per room + houseboat price follow; a later item wins for the same room
+  const p2 = await propose('update_rooms', { booking_id: id, changes: [{ houseboat: 'Pink Lotus', price: 4500 }, { token: 'PIN003', price: 4200 }] });
+  assert.match(p2.pending.preview.lines.join('\n'), /PIN003.*₹4,000 -> ₹4,200/);
+  assert.match(p2.pending.preview.lines.join('\n'), /You owe Pink Lotus \+₹2,400/);
+  await confirm(p2.pending.token, false);
+  // an unknown token is refused with the list of real ones
+  ai.queue.push(call('update_rooms', { booking_id: id, changes: [{ token: 'PIN009', shikara: false }] }), say('PIN009 does not exist.'));
+  assert.equal((await api('POST', '/api/chat', { body: { message: 'PIN009 no shikara' } })).data.pending, null);
+  // the AI sends three update_room calls at once: they become ONE card with all three rooms
+  ai.queue.length = 0;
+  ai.queue.push({ parts: [], text: '', functionCalls: [
+    { name: 'update_room', args: { booking_id: id, token: 'PIN001', shikara_price: 650 } },
+    { name: 'update_room', args: { booking_id: id, token: 'PIN002', shikara_price: 850 } },
+    { name: 'set_shikara', args: { booking_id: id, included: false, houseboat: 'Blue Bay' } },
+  ] });
+  const m = await api('POST', '/api/chat', { body: { message: 'pehle 650, dusre 850, blue me shikara nahi' } });
+  assert.equal(m.data.pending.tool, 'update_rooms');
+  const ml = m.data.pending.preview.lines.join('\n');
+  assert.match(ml, /PIN001.*₹650/); assert.match(ml, /PIN002.*₹850/); assert.match(ml, /BLU001.*✗/); assert.match(ml, /BLU002.*✗/);
+  assert.equal((await confirm(m.data.pending.token)).data.status, 'confirmed');
+  const b2 = (await bookings()).find((x) => x.id === id);
+  assert.equal(b2.billed, (2 * 5000 + 3 * 4000) * 2 + 650 + 850 + 700);
+});
