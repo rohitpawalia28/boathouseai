@@ -4,6 +4,7 @@ services:
   - type: web
     name: boathouse-ai
     runtime: node
+    region: singapore     # close to MongoDB Atlas in Mumbai; cannot be changed after the service is created
     plan: free            # free sleeps after 15 minutes without visitors; choose "starter" to keep it always on
     buildCommand: npm install --omit=dev
     startCommand: npm start
